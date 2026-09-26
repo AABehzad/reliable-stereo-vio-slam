@@ -1,0 +1,695 @@
+#include "my_slam/backend/local_bundle_adjuster.hpp"
+
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <unordered_map>
+#include <vector>
+
+#include <ceres/ceres.h>
+#include <ceres/rotation.h>
+
+#include <opencv2/calib3d.hpp>
+#include <opencv2/core.hpp>
+
+namespace my_slam
+{
+
+namespace
+{
+
+struct PoseBlock
+{
+    double angle_axis[3] = {0.0, 0.0, 0.0};
+    double translation[3] = {0.0, 0.0, 0.0};
+};
+
+struct PointBlock
+{
+    double xyz[3] = {0.0, 0.0, 0.0};
+};
+
+
+// ------------------------------------------------------------
+// Projection helper for Ceres.
+//
+// Pose parameters represent T_C_W:
+//
+// X_C = R_CW * X_W + t_CW
+// ------------------------------------------------------------
+
+struct ReprojectionCost
+{
+    ReprojectionCost(
+        double u,
+        double v,
+        double fx,
+        double fy,
+        double cx,
+        double cy
+    )
+        : u_(u),
+          v_(v),
+          fx_(fx),
+          fy_(fy),
+          cx_(cx),
+          cy_(cy)
+    {
+    }
+
+    template <typename T>
+    bool operator()(
+        const T* const camera_pose,
+        const T* const point,
+        T* residuals
+    ) const
+    {
+        const T* r =
+            camera_pose;
+
+        const T* t =
+            camera_pose + 3;
+
+        T p[3];
+
+        ceres::AngleAxisRotatePoint(
+            r,
+            point,
+            p
+        );
+
+        p[0] += t[0];
+        p[1] += t[1];
+        p[2] += t[2];
+
+        // Guard against invalid depth.
+        //
+        // Ceres still needs a smooth function, therefore use
+        // a small positive denominator for numerical stability.
+        const T z =
+            p[2] >
+                T(1e-8)
+                ? p[2]
+                : T(1e-8);
+
+        const T u =
+            T(fx_) *
+            p[0] / z
+            +
+            T(cx_);
+
+        const T v =
+            T(fy_) *
+            p[1] / z
+            +
+            T(cy_);
+
+        residuals[0] =
+            u - T(u_);
+
+        residuals[1] =
+            v - T(v_);
+
+        return true;
+    }
+
+    double u_;
+    double v_;
+
+    double fx_;
+    double fy_;
+    double cx_;
+    double cy_;
+};
+
+
+Eigen::Matrix4d
+poseToCameraWorld(
+    const PoseBlock& pose
+)
+{
+    cv::Mat rvec(
+        3,
+        1,
+        CV_64F
+    );
+
+    cv::Mat tvec(
+        3,
+        1,
+        CV_64F
+    );
+
+    for (int i = 0; i < 3; ++i)
+    {
+        rvec.at<double>(i, 0) =
+            pose.angle_axis[i];
+
+        tvec.at<double>(i, 0) =
+            pose.translation[i];
+    }
+
+    cv::Mat R;
+
+    cv::Rodrigues(
+        rvec,
+        R
+    );
+
+    Eigen::Matrix4d T_C_W =
+        Eigen::Matrix4d::Identity();
+
+    for (int r = 0; r < 3; ++r)
+    {
+        for (int c = 0; c < 3; ++c)
+        {
+            T_C_W(r, c) =
+                R.at<double>(r, c);
+        }
+
+        T_C_W(r, 3) =
+            tvec.at<double>(r, 0);
+    }
+
+    return T_C_W;
+}
+
+
+PoseBlock
+cameraWorldToPose(
+    const Eigen::Matrix4d& T_C_W
+)
+{
+    PoseBlock pose;
+
+    cv::Mat R(
+        3,
+        3,
+        CV_64F
+    );
+
+    cv::Mat tvec(
+        3,
+        1,
+        CV_64F
+    );
+
+    for (int r = 0; r < 3; ++r)
+    {
+        for (int c = 0; c < 3; ++c)
+        {
+            R.at<double>(r, c) =
+                T_C_W(r, c);
+        }
+
+        tvec.at<double>(r, 0) =
+            T_C_W(r, 3);
+    }
+
+    cv::Mat rvec;
+
+    cv::Rodrigues(
+        R,
+        rvec
+    );
+
+    for (int i = 0; i < 3; ++i)
+    {
+        pose.angle_axis[i] =
+            rvec.at<double>(i, 0);
+
+        pose.translation[i] =
+            tvec.at<double>(i, 0);
+    }
+
+    return pose;
+}
+
+
+double
+computeInitialObservationRmse(
+    LocalMap& local_map,
+    const CameraModel& camera
+)
+{
+    double squared_error_sum = 0.0;
+    std::size_t count = 0;
+
+    const auto active_keyframes =
+        local_map.activeKeyFrames();
+
+    for (const auto keyframe_id :
+         active_keyframes)
+    {
+        const auto keyframe =
+            local_map.getKeyFrame(
+                keyframe_id
+            );
+
+        if (!keyframe)
+        {
+            continue;
+        }
+
+        const Eigen::Matrix4d T_C_W =
+            keyframe->T_W_C.inverse();
+
+        for (const auto& [feature_index, map_point_id] :
+             keyframe->feature_to_mappoint)
+        {
+            const auto map_point =
+                local_map.getMapPoint(
+                    map_point_id
+                );
+
+            if (!map_point ||
+                !map_point->active)
+            {
+                continue;
+            }
+
+            if (feature_index >=
+                keyframe->features.keypoints.size())
+            {
+                continue;
+            }
+
+            const Eigen::Vector4d X_W(
+                map_point->position_w.x(),
+                map_point->position_w.y(),
+                map_point->position_w.z(),
+                1.0
+            );
+
+            const Eigen::Vector4d X_C =
+                T_C_W * X_W;
+
+            if (X_C.z() <= 1e-8)
+            {
+                continue;
+            }
+
+            const double u =
+                camera.fx() *
+                X_C.x() /
+                X_C.z()
+                +
+                camera.cx();
+
+            const double v =
+                camera.fy() *
+                X_C.y() /
+                X_C.z()
+                +
+                camera.cy();
+
+            const auto& observed =
+                keyframe
+                    ->features
+                    .keypoints
+                    [feature_index]
+                    .pt;
+
+            const double dx =
+                u -
+                static_cast<double>(
+                    observed.x
+                );
+
+            const double dy =
+                v -
+                static_cast<double>(
+                    observed.y
+                );
+
+            squared_error_sum +=
+                dx * dx
+                +
+                dy * dy;
+
+            ++count;
+        }
+    }
+
+    if (count == 0)
+    {
+        return 0.0;
+    }
+
+    return std::sqrt(
+        squared_error_sum /
+        static_cast<double>(
+            count
+        )
+    );
+}
+
+
+double
+computeFinalObservationRmse(
+    LocalMap& local_map,
+    const CameraModel& camera
+)
+{
+    return computeInitialObservationRmse(
+        local_map,
+        camera
+    );
+}
+
+} // namespace
+
+
+LocalBundleAdjuster::LocalBundleAdjuster(
+    std::size_t max_iterations
+)
+    : max_iterations_(max_iterations)
+{
+}
+
+
+BundleAdjustmentResult
+LocalBundleAdjuster::optimize(
+    LocalMap& local_map,
+    const CameraModel& camera
+) const
+{
+    BundleAdjustmentResult result;
+
+    const auto active_keyframes =
+        local_map.activeKeyFrames();
+
+    const auto active_map_points =
+        local_map.activeMapPoints();
+
+    if (active_keyframes.size() < 2 ||
+        active_map_points.empty())
+    {
+        return result;
+    }
+
+    result.keyframes_optimized =
+        active_keyframes.size();
+
+    // --------------------------------------------------------
+    // Parameter blocks
+    //
+    // Ceres uses T_C_W.
+    // Our map stores T_W_C.
+    // --------------------------------------------------------
+
+    std::unordered_map<
+        KeyFrameId,
+        PoseBlock
+    > poses;
+
+    std::unordered_map<
+        MapPointId,
+        PointBlock
+    > points;
+
+    poses.reserve(
+        active_keyframes.size()
+    );
+
+    points.reserve(
+        active_map_points.size()
+    );
+
+    for (const auto keyframe_id :
+         active_keyframes)
+    {
+        const auto keyframe =
+            local_map.getKeyFrame(
+                keyframe_id
+            );
+
+        if (!keyframe)
+        {
+            continue;
+        }
+
+        const Eigen::Matrix4d T_C_W =
+            keyframe->T_W_C.inverse();
+
+        poses.emplace(
+            keyframe_id,
+            cameraWorldToPose(
+                T_C_W
+            )
+        );
+    }
+
+    for (const auto& map_point :
+         active_map_points)
+    {
+        if (!map_point)
+        {
+            continue;
+        }
+
+        PointBlock block;
+
+        block.xyz[0] =
+            map_point->position_w.x();
+
+        block.xyz[1] =
+            map_point->position_w.y();
+
+        block.xyz[2] =
+            map_point->position_w.z();
+
+        points.emplace(
+            map_point->id,
+            block
+        );
+    }
+
+    ceres::Problem problem;
+
+    std::size_t observations_used = 0;
+
+    for (const auto keyframe_id :
+         active_keyframes)
+    {
+        const auto keyframe =
+            local_map.getKeyFrame(
+                keyframe_id
+            );
+
+        if (!keyframe)
+        {
+            continue;
+        }
+
+        const auto pose_it =
+            poses.find(
+                keyframe_id
+            );
+
+        if (pose_it == poses.end())
+        {
+            continue;
+        }
+
+        for (const auto& [feature_index, map_point_id] :
+             keyframe->feature_to_mappoint)
+        {
+            const auto point_it =
+                points.find(
+                    map_point_id
+                );
+
+            if (point_it == points.end())
+            {
+                continue;
+            }
+
+            if (feature_index >=
+                keyframe->features.keypoints.size())
+            {
+                continue;
+            }
+
+            const auto& keypoint =
+                keyframe
+                    ->features
+                    .keypoints
+                    [feature_index];
+
+            auto* cost =
+                new ceres::AutoDiffCostFunction<
+                    ReprojectionCost,
+                    2,
+                    6,
+                    3
+                >(
+                    new ReprojectionCost(
+                        keypoint.pt.x,
+                        keypoint.pt.y,
+                        camera.fx(),
+                        camera.fy(),
+                        camera.cx(),
+                        camera.cy()
+                    )
+                );
+
+            problem.AddResidualBlock(
+                cost,
+                new ceres::HuberLoss(1.0),
+                pose_it->second.angle_axis,
+                point_it->second.xyz
+            );
+
+            ++observations_used;
+        }
+    }
+
+    result.observations_used =
+        observations_used;
+
+    if (observations_used < 10)
+    {
+        return result;
+    }
+
+    // --------------------------------------------------------
+    // Gauge fixing.
+    //
+    // First active KeyFrame remains fixed.
+    // --------------------------------------------------------
+
+    const KeyFrameId fixed_keyframe_id =
+        active_keyframes.front();
+
+    const auto fixed_pose_it =
+        poses.find(
+            fixed_keyframe_id
+        );
+
+    if (fixed_pose_it != poses.end())
+    {
+        problem.SetParameterBlockConstant(
+            fixed_pose_it
+                ->second
+                .angle_axis
+        );
+    }
+
+    // --------------------------------------------------------
+    // Initial error.
+    // --------------------------------------------------------
+
+    result.initial_rmse_px =
+        computeInitialObservationRmse(
+            local_map,
+            camera
+        );
+
+    // --------------------------------------------------------
+    // Solver configuration.
+    // --------------------------------------------------------
+
+    ceres::Solver::Options options;
+
+    options.max_num_iterations =
+        static_cast<int>(
+            max_iterations_
+        );
+
+    options.linear_solver_type =
+        ceres::SPARSE_SCHUR;
+
+    options.minimizer_progress_to_stdout =
+        false;
+
+    options.num_threads =
+        1;
+
+    ceres::Solver::Summary summary;
+
+    ceres::Solve(
+        options,
+        &problem,
+        &summary
+    );
+
+    // --------------------------------------------------------
+    // Write optimized poses back into LocalMap.
+    // --------------------------------------------------------
+
+    for (auto& [keyframe_id, pose] :
+         poses)
+    {
+        const auto keyframe =
+            local_map.getKeyFrame(
+                keyframe_id
+            );
+
+        if (!keyframe)
+        {
+            continue;
+        }
+
+        const Eigen::Matrix4d
+            T_C_W_optimized =
+                poseToCameraWorld(
+                    pose
+                );
+
+        keyframe->T_W_C =
+            T_C_W_optimized.inverse();
+    }
+
+    // --------------------------------------------------------
+    // Write optimized MapPoint positions back.
+    // --------------------------------------------------------
+
+    for (auto& [map_point_id, point] :
+         points)
+    {
+        const auto map_point =
+            local_map.getMapPoint(
+                map_point_id
+            );
+
+        if (!map_point)
+        {
+            continue;
+        }
+
+        map_point->position_w =
+            Eigen::Vector3d(
+                point.xyz[0],
+                point.xyz[1],
+                point.xyz[2]
+            );
+    }
+
+    result.final_rmse_px =
+        computeFinalObservationRmse(
+            local_map,
+            camera
+        );
+
+    result.initial_cost =
+        summary.initial_cost;
+
+    result.final_cost =
+        summary.final_cost;
+
+    result.iterations =
+        static_cast<std::size_t>(
+            summary.iterations.size()
+        );
+
+    result.map_points_optimized =
+        points.size();
+
+    result.success =
+        summary.IsSolutionUsable();
+
+    return result;
+}
+
+} // namespace my_slam

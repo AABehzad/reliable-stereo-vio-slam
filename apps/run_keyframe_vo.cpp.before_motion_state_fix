@@ -1,0 +1,1359 @@
+#include <cmath>
+#include <unordered_map>
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <unordered_set>
+#include <vector>
+
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+
+#include <opencv2/core.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/imgcodecs.hpp>
+
+#include "my_slam/camera/camera_model.hpp"
+#include "my_slam/frontend/feature_matcher.hpp"
+#include "my_slam/frontend/local_map_tracker.hpp"
+#include "my_slam/frontend/orb_extractor.hpp"
+#include "my_slam/geometry/pnp_solver.hpp"
+#include "my_slam/geometry/stereo_geometry.hpp"
+#include "my_slam/io/euroc_reader.hpp"
+#include "my_slam/map/local_map.hpp"
+
+namespace
+{
+
+Eigen::Matrix4d cvPoseToEigen(
+    const cv::Mat& R,
+    const cv::Mat& t
+)
+{
+    Eigen::Matrix4d T =
+        Eigen::Matrix4d::Identity();
+
+    for (int r = 0; r < 3; ++r)
+    {
+        for (int c = 0; c < 3; ++c)
+        {
+            T(r, c) =
+                R.at<double>(r, c);
+        }
+
+        T(r, 3) =
+            t.at<double>(r, 0);
+    }
+
+    return T;
+}
+
+
+Eigen::Vector3d cameraToWorld(
+    const Eigen::Matrix4d& T_W_C,
+    const cv::Point3d& point_c
+)
+{
+    const Eigen::Vector4d p_c(
+        point_c.x,
+        point_c.y,
+        point_c.z,
+        1.0
+    );
+
+    const Eigen::Vector4d p_w =
+        T_W_C * p_c;
+
+    return p_w.head<3>();
+}
+
+
+double rotationMagnitudeDeg(
+    const Eigen::Matrix3d& R
+)
+{
+    Eigen::AngleAxisd angle_axis(R);
+
+    return
+        angle_axis.angle()
+        * 180.0
+        / 3.14159265358979323846;
+}
+
+
+void writePose(
+    std::ofstream& csv,
+    std::size_t frame_index,
+    my_slam::Timestamp timestamp,
+    const Eigen::Matrix4d& T_W_C
+)
+{
+    Eigen::Quaterniond q(
+        T_W_C.block<3, 3>(0, 0)
+    );
+
+    q.normalize();
+
+    csv
+        << frame_index << ','
+        << timestamp << ','
+        << T_W_C(0, 3) << ','
+        << T_W_C(1, 3) << ','
+        << T_W_C(2, 3) << ','
+        << q.x() << ','
+        << q.y() << ','
+        << q.z() << ','
+        << q.w()
+        << '\n';
+}
+
+} // namespace
+
+
+int main(int argc, char** argv)
+{
+    const std::filesystem::path dataset =
+        "/datasets/EuRoC/MH_01_easy";
+
+    std::size_t start_frame = 0;
+    std::size_t end_frame = 100;
+
+    if (argc >= 2)
+    {
+        start_frame =
+            std::stoul(argv[1]);
+    }
+
+    if (argc >= 3)
+    {
+        end_frame =
+            std::stoul(argv[2]);
+    }
+
+    // --------------------------------------------------
+    // Dataset
+    // --------------------------------------------------
+
+    my_slam::EurocReader reader(dataset);
+
+    if (!reader.loadCam0() ||
+        !reader.loadCam1())
+    {
+        std::cerr
+            << "Failed to load stereo dataset.\n";
+
+        return 1;
+    }
+
+    const auto& cam0_records =
+        reader.cam0();
+
+    const auto& cam1_records =
+        reader.cam1();
+
+    const std::size_t frame_count =
+        std::min(
+            cam0_records.size(),
+            cam1_records.size()
+        );
+
+    if (start_frame >= frame_count)
+    {
+        std::cerr
+            << "Start frame out of range.\n";
+
+        return 1;
+    }
+
+    end_frame =
+        std::min(
+            end_frame,
+            frame_count - 1
+        );
+
+    if (end_frame <= start_frame)
+    {
+        std::cerr
+            << "Invalid frame range.\n";
+
+        return 1;
+    }
+
+    // --------------------------------------------------
+    // Calibration
+    // --------------------------------------------------
+
+    const auto cam0 =
+        my_slam::CameraModel::loadEuroc(
+            dataset
+            / "mav0"
+            / "cam0"
+            / "sensor.yaml"
+        );
+
+    const auto cam1 =
+        my_slam::CameraModel::loadEuroc(
+            dataset
+            / "mav0"
+            / "cam1"
+            / "sensor.yaml"
+        );
+
+    // --------------------------------------------------
+    // Components
+    // --------------------------------------------------
+
+    my_slam::OrbExtractor extractor(
+        1600,
+        1.2f,
+        8
+    );
+
+    my_slam::FeatureMatcher matcher(
+        0.75f
+    );
+
+    my_slam::LocalMapTracker local_map_tracker(
+        0.75f
+    );
+
+    my_slam::StereoGeometry stereo;
+
+    my_slam::PnPSolver pnp;
+
+    // Sliding local map containing at most 7 active KFs.
+    my_slam::LocalMap local_map(7);
+
+    // --------------------------------------------------
+    // Output
+    // --------------------------------------------------
+
+    std::ofstream trajectory(
+        "/results/euroc_keyframe_vo.csv"
+    );
+
+    if (!trajectory.is_open())
+    {
+        std::cerr
+            << "Failed to create trajectory file.\n";
+
+        return 1;
+    }
+
+    trajectory
+        << "frame,timestamp_ns,"
+        << "x_m,y_m,z_m,"
+        << "qx,qy,qz,qw\n";
+
+    trajectory
+        << std::setprecision(15);
+
+    // ==================================================
+    // Initialize using first stereo frame
+    // ==================================================
+
+    const cv::Mat initial_left =
+        cv::imread(
+            cam0_records[start_frame]
+                .image_path.string(),
+            cv::IMREAD_GRAYSCALE
+        );
+
+    const cv::Mat initial_right =
+        cv::imread(
+            cam1_records[start_frame]
+                .image_path.string(),
+            cv::IMREAD_GRAYSCALE
+        );
+
+    if (initial_left.empty() ||
+        initial_right.empty())
+    {
+        std::cerr
+            << "Failed to load initial stereo pair.\n";
+
+        return 1;
+    }
+
+    const auto initial_left_features =
+        extractor.extract(
+            initial_left
+        );
+
+    const auto initial_right_features =
+        extractor.extract(
+            initial_right
+        );
+
+    const auto initial_stereo_matches =
+        matcher.match(
+            initial_left_features,
+            initial_right_features
+        );
+
+    const auto initial_stereo =
+        stereo.triangulate(
+            initial_left_features,
+            initial_right_features,
+            initial_stereo_matches.good_matches,
+            cam0,
+            cam1
+        );
+
+    if (!initial_stereo.success)
+    {
+        std::cerr
+            << "Initial stereo triangulation failed.\n";
+
+        return 1;
+    }
+
+    // Initial camera defines world coordinate system.
+    Eigen::Matrix4d T_W_C =
+        Eigen::Matrix4d::Identity();
+
+    auto last_keyframe =
+        local_map.createKeyFrame(
+            cam0_records[start_frame]
+                .timestamp_ns,
+            T_W_C,
+            initial_left_features
+        );
+
+    std::size_t initial_points_created = 0;
+
+    for (const auto& landmark :
+         initial_stereo.landmarks)
+    {
+        const Eigen::Vector3d p_w =
+            cameraToWorld(
+                T_W_C,
+                landmark.point_cam0_m
+            );
+
+        auto map_point =
+            local_map.createMapPoint(
+                p_w
+            );
+
+        local_map.addObservation(
+            last_keyframe->id,
+            static_cast<std::size_t>(
+                landmark.match.queryIdx
+            ),
+            map_point->id
+        );
+
+        ++initial_points_created;
+    }
+
+    std::size_t last_keyframe_frame =
+        start_frame;
+
+    // --------------------------------------------------
+    // Temporal tracking state
+    //
+    // Must live in main() scope because it is preserved
+    // from one successfully accepted frame to the next.
+    //
+    // Frame 0 is also KeyFrame 0, so its MapPoint
+    // associations initialize the temporal tracker.
+    // --------------------------------------------------
+
+    my_slam::FeatureSet previous_frame_features =
+        last_keyframe->features;
+
+    my_slam::FrameMapAssociations
+        previous_frame_associations =
+            last_keyframe->feature_to_mappoint;
+
+    writePose(
+        trajectory,
+        start_frame,
+        cam0_records[start_frame]
+            .timestamp_ns,
+        T_W_C
+    );
+
+    std::cout
+        << "====================================\n"
+        << "       KeyFrame Stereo VO\n"
+        << "====================================\n";
+
+    std::cout
+        << "Frame range     : "
+        << start_frame
+        << " -> "
+        << end_frame
+        << '\n';
+
+    std::cout
+        << "Initial KF ID   : "
+        << last_keyframe->id
+        << '\n';
+
+    std::cout
+        << "Initial points  : "
+        << initial_points_created
+        << "\n\n";
+
+    // --------------------------------------------------
+    // Statistics
+    // --------------------------------------------------
+
+    std::size_t successful_frames = 0;
+    std::size_t keyframes_created = 1;
+
+    double total_pnp_inliers = 0.0;
+    double total_correspondences = 0.0;
+
+    // ==================================================
+    // Tracking loop
+    // ==================================================
+
+    for (std::size_t frame_index =
+             start_frame + 1;
+         frame_index <= end_frame;
+         ++frame_index)
+    {
+        const cv::Mat current_left =
+            cv::imread(
+                cam0_records[frame_index]
+                    .image_path.string(),
+                cv::IMREAD_GRAYSCALE
+            );
+
+        if (current_left.empty())
+        {
+            std::cerr
+                << "Failed to load frame "
+                << frame_index
+                << '\n';
+
+            break;
+        }
+
+        const auto current_features =
+            extractor.extract(
+                current_left
+            );
+
+        // --------------------------------------------------
+        // Track current frame against the complete ACTIVE
+        // local map rather than only the last KeyFrame.
+        //
+        // This combines observations from several recent
+        // KeyFrames and then removes duplicate MapPoint /
+        // feature associations.
+        // --------------------------------------------------
+
+        auto local_tracking =
+            local_map_tracker
+                .buildCorrespondences(
+                    local_map,
+                    current_features,
+                    previous_frame_features,
+                    previous_frame_associations
+                );
+
+        // --------------------------------------------------
+        // Start from all Hybrid Local+Temporal
+        // correspondences.
+        //
+        // These working vectors may be reduced by the
+        // motion-model reprojection gate below.
+        // --------------------------------------------------
+
+        std::vector<cv::Point3f> object_points =
+            local_tracking.object_points;
+
+        std::vector<cv::Point2f> image_points =
+            local_tracking.image_points;
+
+        std::vector<my_slam::MapPointId>
+            correspondence_mp_ids =
+                local_tracking.map_point_ids;
+
+        std::vector<std::size_t>
+            correspondence_current_features =
+                local_tracking
+                    .current_feature_indices;
+
+        const std::size_t raw_correspondence_count =
+            object_points.size();
+
+        if (raw_correspondence_count < 20)
+        {
+            std::cerr
+                << "Tracking lost at frame "
+                << frame_index
+                << ": only "
+                << raw_correspondence_count
+                << " raw map correspondences.\n";
+
+            break;
+        }
+
+        // --------------------------------------------------
+        // Constant-velocity motion prediction.
+        //
+        // Stored poses are T_W_C.
+        //
+        // delta =
+        //     inverse(T_W_C[k-2]) * T_W_C[k-1]
+        //
+        // predicted:
+        //     T_W_C[k] =
+        //         T_W_C[k-1] * delta
+        // --------------------------------------------------
+
+        bool have_motion_prediction =
+            accepted_pose_history >= 2;
+
+        Eigen::Matrix4d predicted_T_W_C =
+            T_W_C;
+
+        cv::Mat predicted_rvec;
+        cv::Mat predicted_tvec;
+
+        constexpr double reprojection_gate_px =
+            80.0;
+
+        std::size_t rejected_by_prediction =
+            0;
+
+        if (have_motion_prediction)
+        {
+            const Eigen::Matrix4d
+                T_prevprev_prev =
+                    T_W_C_prev_prev
+                        .inverse()
+                    * T_W_C_prev;
+
+            predicted_T_W_C =
+                T_W_C_prev
+                * T_prevprev_prev;
+
+            const Eigen::Matrix4d
+                predicted_T_C_W =
+                    predicted_T_W_C
+                        .inverse();
+
+            cv::Mat predicted_R(
+                3,
+                3,
+                CV_64F
+            );
+
+            predicted_tvec =
+                cv::Mat(
+                    3,
+                    1,
+                    CV_64F
+                );
+
+            for (int r = 0;
+                 r < 3;
+                 ++r)
+            {
+                for (int c = 0;
+                     c < 3;
+                     ++c)
+                {
+                    predicted_R.at<double>(
+                        r,
+                        c
+                    ) =
+                        predicted_T_C_W(
+                            r,
+                            c
+                        );
+                }
+
+                predicted_tvec.at<double>(
+                    r,
+                    0
+                ) =
+                    predicted_T_C_W(
+                        r,
+                        3
+                    );
+            }
+
+            cv::Rodrigues(
+                predicted_R,
+                predicted_rvec
+            );
+
+            // ----------------------------------------------
+            // Project every candidate MapPoint using the
+            // predicted camera pose.
+            // ----------------------------------------------
+
+            std::vector<cv::Point2f>
+                predicted_pixels;
+
+            cv::projectPoints(
+                object_points,
+                predicted_rvec,
+                predicted_tvec,
+                cam0.K(),
+                cam0.distortion(),
+                predicted_pixels
+            );
+
+            std::vector<cv::Point3f>
+                gated_object_points;
+
+            std::vector<cv::Point2f>
+                gated_image_points;
+
+            std::vector<my_slam::MapPointId>
+                gated_mp_ids;
+
+            std::vector<std::size_t>
+                gated_current_features;
+
+            gated_object_points.reserve(
+                object_points.size()
+            );
+
+            gated_image_points.reserve(
+                image_points.size()
+            );
+
+            gated_mp_ids.reserve(
+                correspondence_mp_ids.size()
+            );
+
+            gated_current_features.reserve(
+                correspondence_current_features.size()
+            );
+
+            for (std::size_t i = 0;
+                 i < object_points.size();
+                 ++i)
+            {
+                const double dx =
+                    static_cast<double>(
+                        predicted_pixels[i].x
+                        -
+                        image_points[i].x
+                    );
+
+                const double dy =
+                    static_cast<double>(
+                        predicted_pixels[i].y
+                        -
+                        image_points[i].y
+                    );
+
+                const double error_px =
+                    std::sqrt(
+                        dx * dx
+                        +
+                        dy * dy
+                    );
+
+                if (!std::isfinite(error_px) ||
+                    error_px >
+                        reprojection_gate_px)
+                {
+                    ++rejected_by_prediction;
+
+                    continue;
+                }
+
+                gated_object_points.push_back(
+                    object_points[i]
+                );
+
+                gated_image_points.push_back(
+                    image_points[i]
+                );
+
+                gated_mp_ids.push_back(
+                    correspondence_mp_ids[i]
+                );
+
+                gated_current_features.push_back(
+                    correspondence_current_features[i]
+                );
+            }
+
+            object_points.swap(
+                gated_object_points
+            );
+
+            image_points.swap(
+                gated_image_points
+            );
+
+            correspondence_mp_ids.swap(
+                gated_mp_ids
+            );
+
+            correspondence_current_features.swap(
+                gated_current_features
+            );
+        }
+
+        // --------------------------------------------------
+        // Do NOT fall back to unguided PnP if the motion
+        // gate rejects almost everything.
+        //
+        // In that case the frontend has genuinely lost
+        // geometric consistency and should stop safely.
+        // --------------------------------------------------
+
+        if (object_points.size() < 20)
+        {
+            std::cerr
+                << "Guided tracking lost at frame "
+                << frame_index
+                << " | rawCorr="
+                << raw_correspondence_count
+                << " | guidedCorr="
+                << object_points.size()
+                << " | rejected="
+                << rejected_by_prediction
+                << '\n';
+
+            break;
+        }
+
+        if (frame_index >= 268 &&
+            frame_index <= 280)
+        {
+            std::cout
+                << "GUIDED frame="
+                << frame_index
+                << " | rawCorr="
+                << raw_correspondence_count
+                << " | guidedCorr="
+                << object_points.size()
+                << " | rejected="
+                << rejected_by_prediction
+                << " | prediction="
+                << (have_motion_prediction
+                        ? "ON"
+                        : "OFF")
+                << '\n';
+        }
+
+        // --------------------------------------------------
+        // PnP using WORLD map points.
+        //
+        // solvePnP returns:
+        //
+        // X_C = R_CW * X_W + t_CW
+        //
+        // so result is T_C_W.
+        // --------------------------------------------------
+
+        const auto pose =
+            have_motion_prediction
+                ? pnp.estimateWithGuess(
+                    object_points,
+                    image_points,
+                    cam0,
+                    predicted_rvec,
+                    predicted_tvec
+                )
+                : pnp.estimate(
+                    object_points,
+                    image_points,
+                    cam0
+                );
+
+        if (!pose.success)
+        {
+            std::cerr
+                << "PnP tracking failed at frame "
+                << frame_index
+                << '\n';
+
+            break;
+        }
+
+        const Eigen::Matrix4d T_C_W =
+            cvPoseToEigen(
+                pose.rotation_matrix,
+                pose.tvec
+            );
+
+        const Eigen::Matrix4d candidate_T_W_C =
+            T_C_W.inverse();
+
+        // --------------------------------------------------
+        // Pose sanity check
+        //
+        // Compare candidate pose against the previous
+        // successfully accepted frame.
+        // --------------------------------------------------
+
+        const Eigen::Matrix4d T_prev_current =
+            T_W_C.inverse()
+            * candidate_T_W_C;
+
+        const double step_translation_m =
+            T_prev_current
+                .block<3, 1>(0, 3)
+                .norm();
+
+        const double step_rotation_deg =
+            rotationMagnitudeDeg(
+                T_prev_current
+                    .block<3, 3>(0, 0)
+            );
+
+        constexpr double max_step_translation_m =
+            0.35;
+
+        constexpr double max_step_rotation_deg =
+            15.0;
+
+        if (step_translation_m >
+                max_step_translation_m
+            ||
+            step_rotation_deg >
+                max_step_rotation_deg)
+        {
+            std::cerr
+                << "POSE GUARD rejected frame "
+                << frame_index
+                << " | translation="
+                << step_translation_m
+                << " m"
+                << " | rotation="
+                << step_rotation_deg
+                << " deg"
+                << " | rawCorr="
+                << raw_correspondence_count
+                << " | guidedCorr="
+                << object_points.size()
+                << " | rejected="
+                << rejected_by_prediction
+                << " | inliers="
+                << pose.pnp_inlier_count
+                << '\n';
+
+            break;
+        }
+
+        // Candidate pose passed sanity checks.
+        //
+        // Advance motion history only after acceptance.
+        // A rejected candidate must never contaminate the
+        // prediction used by future frames.
+        T_W_C_prev_prev =
+            T_W_C_prev;
+
+        T_W_C_prev =
+            candidate_T_W_C;
+
+        if (accepted_pose_history < 2)
+        {
+            ++accepted_pose_history;
+        }
+
+        T_W_C =
+            candidate_T_W_C;
+
+        ++successful_frames;
+
+        total_pnp_inliers +=
+            pose.pnp_inlier_count;
+
+        total_correspondences +=
+            object_points.size();
+
+        // --------------------------------------------------
+        // Build current-frame MapPoint associations only
+        // from PnP inliers.
+        //
+        // These associations become the temporal tracking
+        // prior for the next frame.
+        // --------------------------------------------------
+
+        my_slam::FrameMapAssociations
+            current_frame_associations;
+
+        for (const auto raw_inlier_index :
+             pose.inlier_indices)
+        {
+            const std::size_t inlier_index =
+                static_cast<std::size_t>(
+                    raw_inlier_index
+                );
+
+            if (inlier_index >=
+                    correspondence_mp_ids.size()
+                ||
+                inlier_index >=
+                    correspondence_current_features.size())
+            {
+                continue;
+            }
+
+            const std::size_t current_feature_index =
+                correspondence_current_features[
+                    inlier_index
+                ];
+
+            const my_slam::MapPointId map_point_id =
+                correspondence_mp_ids[
+                    inlier_index
+                ];
+
+            current_frame_associations[
+                current_feature_index
+            ] = map_point_id;
+        }
+
+        // --------------------------------------------------
+        // Motion relative to last keyframe
+        // --------------------------------------------------
+
+        const Eigen::Matrix4d T_K_C =
+            last_keyframe
+                ->T_W_C
+                .inverse()
+            * T_W_C;
+
+        const double translation_from_kf =
+            T_K_C
+                .block<3, 1>(0, 3)
+                .norm();
+
+        const double rotation_from_kf_deg =
+            rotationMagnitudeDeg(
+                T_K_C.block<3, 3>(
+                    0,
+                    0
+                )
+            );
+
+        const std::size_t frames_since_kf =
+            frame_index
+            - last_keyframe_frame;
+
+        const double inlier_ratio =
+            static_cast<double>(
+                pose.pnp_inlier_count
+            )
+            /
+            static_cast<double>(
+                object_points.size()
+            );
+
+        // --------------------------------------------------
+        // KeyFrame policy V1
+        // --------------------------------------------------
+
+        // --------------------------------------------------
+        // KeyFrame policy V2
+        //
+        // Do not create consecutive KeyFrames just because
+        // the absolute number of tracked features is small.
+        //
+        // We require a minimum temporal spacing except for
+        // the regular maximum interval.
+        // --------------------------------------------------
+
+        constexpr std::size_t min_kf_spacing = 3;
+        constexpr std::size_t max_kf_spacing = 12;
+
+        constexpr double translation_threshold_m = 0.12;
+        constexpr double rotation_threshold_deg = 4.0;
+
+        constexpr double degraded_inlier_ratio = 0.70;
+        constexpr int degraded_inlier_count = 60;
+
+        const bool spacing_ok =
+            frames_since_kf >= min_kf_spacing;
+
+        const bool maximum_interval =
+            frames_since_kf >= max_kf_spacing;
+
+        const bool significant_motion =
+            translation_from_kf >= translation_threshold_m
+            ||
+            rotation_from_kf_deg >= rotation_threshold_deg;
+
+        const bool degraded_tracking =
+            inlier_ratio < degraded_inlier_ratio
+            &&
+            pose.pnp_inlier_count <
+                degraded_inlier_count;
+
+        const bool need_keyframe =
+            maximum_interval
+            ||
+            (
+                spacing_ok
+                &&
+                (
+                    significant_motion
+                    ||
+                    degraded_tracking
+                )
+            );
+
+        // --------------------------------------------------
+        // Create KeyFrame
+        // --------------------------------------------------
+
+        if (need_keyframe)
+        {
+            if (cam0_records[frame_index]
+                    .timestamp_ns
+                !=
+                cam1_records[frame_index]
+                    .timestamp_ns)
+            {
+                std::cerr
+                    << "Stereo sync failure at frame "
+                    << frame_index
+                    << '\n';
+
+                break;
+            }
+
+            const cv::Mat current_right =
+                cv::imread(
+                    cam1_records[frame_index]
+                        .image_path.string(),
+                    cv::IMREAD_GRAYSCALE
+                );
+
+            if (current_right.empty())
+            {
+                std::cerr
+                    << "Failed to load right frame "
+                    << frame_index
+                    << '\n';
+
+                break;
+            }
+
+            const auto right_features =
+                extractor.extract(
+                    current_right
+                );
+
+            const auto stereo_matches =
+                matcher.match(
+                    current_features,
+                    right_features
+                );
+
+            const auto stereo_result =
+                stereo.triangulate(
+                    current_features,
+                    right_features,
+                    stereo_matches.good_matches,
+                    cam0,
+                    cam1
+                );
+
+            if (!stereo_result.success)
+            {
+                std::cerr
+                    << "Stereo failed while creating KF at "
+                    << frame_index
+                    << '\n';
+
+                break;
+            }
+
+            auto new_keyframe =
+                local_map.createKeyFrame(
+                    cam0_records[frame_index]
+                        .timestamp_ns,
+                    T_W_C,
+                    current_features
+                );
+
+            // ----------------------------------------------
+            // Add observations for EXISTING map points.
+            //
+            // Only PnP inliers are trusted.
+            // ----------------------------------------------
+
+            std::unordered_set<std::size_t>
+                associated_current_features;
+
+            for (const int pnp_index :
+                 pose.inlier_indices)
+            {
+                if (pnp_index < 0 ||
+                    pnp_index >=
+                    static_cast<int>(
+                        correspondence_mp_ids.size()
+                    ))
+                {
+                    continue;
+                }
+
+                const auto feature_index =
+                    correspondence_current_features[
+                        pnp_index
+                    ];
+
+                if (associated_current_features
+                        .find(feature_index)
+                    !=
+                    associated_current_features
+                        .end())
+                {
+                    continue;
+                }
+
+                const auto mp_id =
+                    correspondence_mp_ids[
+                        pnp_index
+                    ];
+
+                local_map.addObservation(
+                    new_keyframe->id,
+                    feature_index,
+                    mp_id
+                );
+
+                associated_current_features.insert(
+                    feature_index
+                );
+            }
+
+            const std::size_t existing_observations =
+                associated_current_features.size();
+
+            // ----------------------------------------------
+            // Create NEW map points from current stereo.
+            // ----------------------------------------------
+
+            std::size_t new_points = 0;
+
+            for (const auto& landmark :
+                 stereo_result.landmarks)
+            {
+                const std::size_t left_feature_index =
+                    static_cast<std::size_t>(
+                        landmark.match.queryIdx
+                    );
+
+                // Already linked to an older MapPoint.
+                if (new_keyframe
+                        ->feature_to_mappoint
+                        .find(left_feature_index)
+                    !=
+                    new_keyframe
+                        ->feature_to_mappoint
+                        .end())
+                {
+                    continue;
+                }
+
+                const Eigen::Vector3d p_w =
+                    cameraToWorld(
+                        T_W_C,
+                        landmark.point_cam0_m
+                    );
+
+                auto new_map_point =
+                    local_map.createMapPoint(
+                        p_w
+                    );
+
+                local_map.addObservation(
+                    new_keyframe->id,
+                    left_feature_index,
+                    new_map_point->id
+                );
+
+                ++new_points;
+            }
+
+            // ----------------------------------------------
+            // Remove weak landmarks that have already
+            // left the active local window.
+            // ----------------------------------------------
+
+            // The current frame is now a KeyFrame.
+            // Use its complete association table,
+            // including newly triangulated stereo points.
+            current_frame_associations =
+                new_keyframe->feature_to_mappoint;
+
+            const std::size_t culled_points =
+                local_map.cullWeakMapPoints();
+
+            last_keyframe =
+                new_keyframe;
+
+            last_keyframe_frame =
+                frame_index;
+
+            ++keyframes_created;
+
+            std::cout
+                << "NEW KF frame="
+                << frame_index
+                << " id="
+                << new_keyframe->id
+                << " | tracked="
+                << existing_observations
+                << " | newMP="
+                << new_points
+                << " | totalMP="
+                << local_map.mapPointCount()
+                << " | culledMP="
+                << culled_points
+                << " | activeKF="
+                << local_map
+                    .activeKeyFrames()
+                    .size()
+                << '\n';
+        }
+
+        // --------------------------------------------------
+        // Advance temporal tracking state only after the
+        // current pose has been accepted.
+        // --------------------------------------------------
+
+        previous_frame_features =
+            current_features;
+
+        previous_frame_associations =
+            current_frame_associations;
+
+        // --------------------------------------------------
+        // Save pose for every frame
+        // --------------------------------------------------
+
+        writePose(
+            trajectory,
+            frame_index,
+            cam0_records[frame_index]
+                .timestamp_ns,
+            T_W_C
+        );
+
+        if (successful_frames == 1 ||
+            successful_frames % 20 == 0 ||
+            (frame_index >= 268 &&
+             frame_index <= 280) ||
+            frame_index == end_frame)
+        {
+            std::cout
+                << "Frame "
+                << frame_index
+                << " | localKF="
+                << local_tracking.active_keyframes_considered
+                << " | temporalCand="
+                << local_tracking.temporal_candidate_matches
+                << " | localCand="
+                << local_tracking.local_candidate_matches
+                << " | candidates="
+                << local_tracking.candidate_matches
+                << " | rawCorr="
+                << raw_correspondence_count
+                << " | mapCorr="
+                << object_points.size()
+                << " | gateOut="
+                << rejected_by_prediction
+                << " | inliers="
+                << pose.pnp_inlier_count
+                << " | ratio="
+                << inlier_ratio
+                << " | position=["
+                << T_W_C(0, 3)
+                << ", "
+                << T_W_C(1, 3)
+                << ", "
+                << T_W_C(2, 3)
+                << "] m\n";
+        }
+    }
+
+    trajectory.close();
+
+    // ==================================================
+    // Summary
+    // ==================================================
+
+    std::cout
+        << "\n====================================\n"
+        << "       KeyFrame VO Summary\n"
+        << "====================================\n";
+
+    std::cout
+        << "Successful frames : "
+        << successful_frames
+        << '\n';
+
+    std::cout
+        << "KeyFrames created : "
+        << keyframes_created
+        << '\n';
+
+    std::cout
+        << "Total MapPoints   : "
+        << local_map.mapPointCount()
+        << '\n';
+
+    std::cout
+        << "Active KeyFrames  : "
+        << local_map.activeKeyFrames().size()
+        << '\n';
+
+    std::cout
+        << "Active MapPoints  : "
+        << local_map.activeMapPoints().size()
+        << '\n';
+
+    if (successful_frames > 0)
+    {
+        std::cout
+            << "Average PnP inliers: "
+            << total_pnp_inliers
+                / successful_frames
+            << '\n';
+
+        std::cout
+            << "Average map correspondences: "
+            << total_correspondences
+                / successful_frames
+            << '\n';
+    }
+
+    std::cout
+        << "\nFinal position:\n"
+        << "X = "
+        << T_W_C(0, 3)
+        << " m\n"
+        << "Y = "
+        << T_W_C(1, 3)
+        << " m\n"
+        << "Z = "
+        << T_W_C(2, 3)
+        << " m\n";
+
+    std::cout
+        << "\nTrajectory:\n"
+        << "/results/euroc_keyframe_vo.csv\n";
+
+    if (successful_frames == 0)
+    {
+        return 1;
+    }
+
+    std::cout
+        << "\nKeyFrame VO completed.\n";
+
+    return 0;
+}

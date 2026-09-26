@@ -1,0 +1,7 @@
+build
+.git
+.vscode
+results
+__pycache__
+*.pyc
+*.log

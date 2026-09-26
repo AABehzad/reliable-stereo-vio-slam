@@ -1,0 +1,19 @@
+# Build
+build/
+out/
+
+# VS Code local files
+.vscode/
+
+# Results
+results/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
