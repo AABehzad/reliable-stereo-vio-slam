@@ -36,6 +36,7 @@ add_library(
 
     src/map/local_map.cpp
     src/backend/local_bundle_adjuster.cpp
+    src/loop/loop_detector.cpp
 
 )
 

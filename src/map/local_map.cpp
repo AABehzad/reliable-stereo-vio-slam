@@ -41,6 +41,12 @@ LocalMap::createKeyFrame(
     keyframe->features =
         features;
 
+    if (!features.descriptors.empty())
+    {
+        keyframe->features.descriptors =
+            features.descriptors.clone();
+    }
+
     keyframes_[
         keyframe->id
     ] = keyframe;

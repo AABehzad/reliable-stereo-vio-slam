@@ -28,6 +28,7 @@
 #include "my_slam/geometry/pnp_solver.hpp"
 #include "my_slam/geometry/stereo_geometry.hpp"
 #include "my_slam/io/euroc_reader.hpp"
+#include "my_slam/loop/loop_detector.hpp"
 #include "my_slam/map/local_map.hpp"
 
 namespace
@@ -452,6 +453,25 @@ int main(int argc, char** argv)
     my_slam::LocalBundleAdjuster local_ba(
         50
     );
+
+    // Exclude the recent 30 KeyFrames; this is intentionally conservative
+    // for MH_01, where nearby views can otherwise pass PnP verification.
+    my_slam::LoopDetector loop_detector(30, 5);
+    std::ofstream loop_constraints(
+        "/results/euroc_loop_constraints.csv"
+    );
+    loop_constraints
+        << "# transform: T_candidate_current maps current camera "
+           "coordinates into candidate camera coordinates\n"
+        << "current_kf,candidate_kf,current_timestamp,candidate_timestamp,"
+           "tx,ty,tz,qx,qy,qz,qw,descriptor_matches,geometric_inliers,"
+           "inlier_ratio\n";
+    std::size_t loop_queries = 0;
+    std::size_t loop_candidates_tested = 0;
+    std::size_t loop_verified = 0;
+    std::size_t loop_rejected = 0;
+    int loop_best_descriptor_matches = 0;
+    int loop_best_geometric_inliers = 0;
 
     // Sliding local map containing at most 7 active KFs.
     my_slam::LocalMap local_map(7);
@@ -1810,6 +1830,87 @@ int main(int argc, char** argv)
                     T_W_C;
             }
 
+            // Loop detection is read-only: it records constraints but does
+            // not alter the online pose or local map.
+            const auto loop_result =
+                loop_detector.detect(
+                    local_map,
+                    new_keyframe,
+                    cam0
+                );
+            ++loop_queries;
+            loop_candidates_tested += loop_result.candidates_tested;
+            loop_verified += loop_result.verified_loops.size();
+            loop_rejected += loop_result.rejected;
+            loop_best_descriptor_matches = std::max(
+                loop_best_descriptor_matches,
+                loop_result.best_descriptor_matches
+            );
+            loop_best_geometric_inliers = std::max(
+                loop_best_geometric_inliers,
+                loop_result.best_geometric_inliers
+            );
+
+            for (const auto& candidate : loop_result.candidates)
+            {
+                if (candidate.descriptor_matches < 30)
+                    continue;
+                std::cout
+                    << "LOOP-CANDIDATE\n"
+                    << "currentKF=" << candidate.current_keyframe_id
+                    << " candidateKF=" << candidate.candidate_keyframe_id
+                    << " descriptorMatches=" << candidate.descriptor_matches
+                    << " usable3D2D=" << candidate.usable_3d2d
+                    << " pnpInliers=" << candidate.geometric_inliers
+                    << " inlierRatio=" << candidate.inlier_ratio
+                    << " verified=" << (candidate.verified ? "YES" : "NO")
+                    << '\n';
+            }
+
+            for (const auto& loop : loop_result.verified_loops)
+            {
+                const auto candidate_keyframe =
+                    local_map.getKeyFrame(loop.candidate_keyframe_id);
+                const Eigen::Quaterniond relative_q(
+                    loop.T_candidate_current.block<3, 3>(0, 0)
+                );
+                const Eigen::AngleAxisd relative_angle(
+                    loop.T_candidate_current.block<3, 3>(0, 0)
+                );
+                std::cout
+                    << "LOOP-VERIFIED\n"
+                    << "currentKF=" << loop.current_keyframe_id
+                    << " candidateKF=" << loop.candidate_keyframe_id
+                    << " separation="
+                    << loop.current_keyframe_id - loop.candidate_keyframe_id
+                    << " inliers=" << loop.geometric_inliers
+                    << " ratio=" << loop.inlier_ratio
+                    << " relativeTranslation="
+                    << loop.T_candidate_current.block<3, 1>(0, 3).transpose()
+                    << " relativeRotationDeg="
+                    << relative_angle.angle() * 180.0 /
+                       3.14159265358979323846 << '\n';
+
+                if (candidate_keyframe)
+                {
+                    loop_constraints
+                        << loop.current_keyframe_id << ','
+                        << loop.candidate_keyframe_id << ','
+                        << new_keyframe->timestamp_ns << ','
+                        << candidate_keyframe->timestamp_ns << ','
+                        << loop.T_candidate_current(0, 3) << ','
+                        << loop.T_candidate_current(1, 3) << ','
+                        << loop.T_candidate_current(2, 3) << ','
+                        << relative_q.x() << ','
+                        << relative_q.y() << ','
+                        << relative_q.z() << ','
+                        << relative_q.w() << ','
+                        << loop.descriptor_matches << ','
+                        << loop.geometric_inliers << ','
+                        << loop.inlier_ratio << '\n';
+                }
+            }
+
             created_keyframe_this_frame = true;
 
             last_keyframe =
@@ -1941,6 +2042,7 @@ int main(int argc, char** argv)
     }
 
     trajectory.close();
+    loop_constraints.close();
 
     // ==================================================
     // Summary
@@ -1975,6 +2077,23 @@ int main(int argc, char** argv)
         << "Active MapPoints  : "
         << local_map.activeMapPoints().size()
         << '\n';
+
+    std::cout
+        << "\n====================================\n"
+        << "       Loop Detection Summary\n"
+        << "====================================\n"
+        << "Historical KeyFrames: "
+        << local_map.keyFrameCount() << '\n'
+        << "Queries: " << loop_queries << '\n'
+        << "Candidates tested: " << loop_candidates_tested << '\n'
+        << "Candidates geometrically verified: " << loop_verified << '\n'
+        << "Loops accepted: " << loop_verified << '\n'
+        << "Loops rejected: " << loop_rejected << '\n'
+        << "Best descriptor match count: "
+        << loop_best_descriptor_matches << '\n'
+        << "Best geometric inlier count: "
+        << loop_best_geometric_inliers << '\n'
+        << "Loop constraints: /results/euroc_loop_constraints.csv\n";
 
     if (successful_frames > 0)
     {
