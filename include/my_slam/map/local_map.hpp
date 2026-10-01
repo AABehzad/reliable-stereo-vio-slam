@@ -38,6 +38,13 @@ public:
         MapPointId map_point_id
     );
 
+    void addStereoObservation(
+        KeyFrameId keyframe_id,
+        std::size_t feature_index,
+        MapPointId map_point_id,
+        const Eigen::Vector2d& right_uv
+    );
+
     std::shared_ptr<KeyFrame>
     getKeyFrame(
         KeyFrameId id

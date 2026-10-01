@@ -114,6 +114,34 @@ void LocalMap::addObservation(
 }
 
 
+void LocalMap::addStereoObservation(
+    KeyFrameId keyframe_id,
+    std::size_t feature_index,
+    MapPointId map_point_id,
+    const Eigen::Vector2d& right_uv
+)
+{
+    const auto kf = getKeyFrame(keyframe_id);
+    const auto mp = getMapPoint(map_point_id);
+
+    if (!kf || !mp)
+    {
+        throw std::runtime_error(
+            "Invalid KeyFrame or MapPoint."
+        );
+    }
+
+    Observation observation;
+    observation.keyframe_id = keyframe_id;
+    observation.feature_index = feature_index;
+    observation.has_stereo = true;
+    observation.right_uv = right_uv;
+
+    mp->observations[keyframe_id] = observation;
+    kf->feature_to_mappoint[feature_index] = map_point_id;
+}
+
+
 std::shared_ptr<KeyFrame>
 LocalMap::getKeyFrame(
     KeyFrameId id

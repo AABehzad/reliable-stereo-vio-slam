@@ -404,11 +404,21 @@ StereoGeometry::triangulate(
 
         StereoLandmark landmark;
 
+        // Retain the original image measurements for downstream
+        // reprojection. The triangulation itself uses the
+        // undistorted pixel coordinates above, but BA's residual
+        // applies the calibrated distortion model.
         landmark.left_pixel =
-            left_inliers[i];
+            left_features
+                .keypoints
+                .at(inlier_matches[i].queryIdx)
+                .pt;
 
         landmark.right_pixel =
-            right_inliers[i];
+            right_features
+                .keypoints
+                .at(inlier_matches[i].trainIdx)
+                .pt;
 
         landmark.point_cam0_m =
             cv::Point3d(

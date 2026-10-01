@@ -86,3 +86,14 @@ target_link_libraries(
     PRIVATE
         my_slam_core
 )
+
+add_executable(
+    run_stereo_vio
+    apps/run_stereo_vio.cpp
+)
+
+target_link_libraries(
+    run_stereo_vio
+    PRIVATE
+        my_slam_core
+)

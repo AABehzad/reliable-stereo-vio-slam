@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
+#include <numeric>
 #include <unordered_map>
 #include <vector>
 
@@ -28,6 +30,14 @@ struct PointBlock
 {
     double xyz[3] = {0.0, 0.0, 0.0};
 };
+
+bool getDistortionCoefficients(
+    const CameraModel& camera,
+    double& k1,
+    double& k2,
+    double& p1,
+    double& p2
+);
 
 
 // ------------------------------------------------------------
@@ -114,18 +124,13 @@ struct ReprojectionCost
         // safety measure.
         // ----------------------------------------------------
 
-        const T safe_z =
-            z > T(1e-8)
-                ? z
-                : T(1e-8);
-
         const T x =
             point_camera[0] /
-            safe_z;
+            z;
 
         const T y =
             point_camera[1] /
-            safe_z;
+            z;
 
         const T r2 =
             x * x +
@@ -187,6 +192,131 @@ struct ReprojectionCost
     double k2_;
     double p1_;
     double p2_;
+};
+
+
+struct StereoReprojectionCost
+{
+    StereoReprojectionCost(
+        double u0,
+        double v0,
+        double u1,
+        double v1,
+        const CameraModel& cam0,
+        const CameraModel& cam1,
+        const Eigen::Matrix4d& T_cam1_cam0
+    )
+        : u0_(u0), v0_(v0), u1_(u1), v1_(v1),
+          fx0_(cam0.fx()), fy0_(cam0.fy()),
+          cx0_(cam0.cx()), cy0_(cam0.cy()),
+          fx1_(cam1.fx()), fy1_(cam1.fy()),
+          cx1_(cam1.cx()), cy1_(cam1.cy())
+    {
+        getDistortionCoefficients(
+            cam0, k10_, k20_, p10_, p20_
+        );
+        getDistortionCoefficients(
+            cam1, k11_, k21_, p11_, p21_
+        );
+
+        for (int r = 0; r < 3; ++r)
+        {
+            for (int c = 0; c < 3; ++c)
+            {
+                rotation_3d_[r * 3 + c] =
+                    T_cam1_cam0(r, c);
+            }
+            translation_[r] =
+                T_cam1_cam0(r, 3);
+        }
+    }
+
+    template <typename T>
+    bool operator()(
+        const T* const camera_pose,
+        const T* const point,
+        T* residuals
+    ) const
+    {
+        T point_camera0[3];
+        ceres::AngleAxisRotatePoint(
+            camera_pose,
+            point,
+            point_camera0
+        );
+
+        point_camera0[0] += camera_pose[3];
+        point_camera0[1] += camera_pose[4];
+        point_camera0[2] += camera_pose[5];
+
+        T point_camera1[3];
+        for (int r = 0; r < 3; ++r)
+        {
+            point_camera1[r] =
+                T(translation_[r]);
+            for (int c = 0; c < 3; ++c)
+            {
+                point_camera1[r] +=
+                    T(rotation_3d_[r * 3 + c])
+                    * point_camera0[c];
+            }
+        }
+
+        if (point_camera0[2] <= T(1e-8) ||
+            point_camera1[2] <= T(1e-8))
+        {
+            return false;
+        }
+
+        project(
+            point_camera0,
+            fx0_, fy0_, cx0_, cy0_,
+            k10_, k20_, p10_, p20_,
+            residuals[0], residuals[1]
+        );
+        project(
+            point_camera1,
+            fx1_, fy1_, cx1_, cy1_,
+            k11_, k21_, p11_, p21_,
+            residuals[2], residuals[3]
+        );
+
+        residuals[0] -= T(u0_);
+        residuals[1] -= T(v0_);
+        residuals[2] -= T(u1_);
+        residuals[3] -= T(v1_);
+        return true;
+    }
+
+private:
+    template <typename T>
+    static void project(
+        const T* point,
+        double fx, double fy, double cx, double cy,
+        double k1, double k2, double p1, double p2,
+        T& u, T& v
+    )
+    {
+        const T x = point[0] / point[2];
+        const T y = point[1] / point[2];
+        const T r2 = x * x + y * y;
+        const T radial = T(1.0) + T(k1) * r2
+            + T(k2) * r2 * r2;
+        const T xd = x * radial + T(2.0) * T(p1) * x * y
+            + T(p2) * (r2 + T(2.0) * x * x);
+        const T yd = y * radial + T(p1) * (r2 + T(2.0) * y * y)
+            + T(2.0) * T(p2) * x * y;
+        u = T(fx) * xd + T(cx);
+        v = T(fy) * yd + T(cy);
+    }
+
+    double u0_, v0_, u1_, v1_;
+    double fx0_, fy0_, cx0_, cy0_;
+    double fx1_, fy1_, cx1_, cy1_;
+    double k10_ = 0.0, k20_ = 0.0, p10_ = 0.0, p20_ = 0.0;
+    double k11_ = 0.0, k21_ = 0.0, p11_ = 0.0, p21_ = 0.0;
+    double rotation_3d_[9] = {};
+    double translation_[3] = {};
 };
 
 
@@ -527,6 +657,137 @@ double computeObservationRmse(
     );
 }
 
+
+ResidualDistribution summarizeResiduals(
+    std::vector<double> values
+)
+{
+    ResidualDistribution result;
+
+    if (values.empty())
+    {
+        return result;
+    }
+
+    std::sort(values.begin(), values.end());
+    result.count = values.size();
+    result.mean = std::accumulate(
+        values.begin(), values.end(), 0.0
+    ) / static_cast<double>(values.size());
+    auto percentile = [&values](double q)
+    {
+        const auto index = static_cast<std::size_t>(
+            q * static_cast<double>(values.size() - 1)
+        );
+        return values[index];
+    };
+    result.median = percentile(0.50);
+    result.p75 = percentile(0.75);
+    result.p90 = percentile(0.90);
+    result.p95 = percentile(0.95);
+    result.max = values.back();
+
+    for (const double value : values)
+    {
+        if (value > 2.0) ++result.over_2px;
+        if (value > 3.0) ++result.over_3px;
+        if (value > 5.0) ++result.over_5px;
+    }
+    return result;
+}
+
+
+void projectDistorted(
+    const Eigen::Vector4d& point_camera,
+    const CameraModel& camera,
+    cv::Point2d& pixel
+)
+{
+    double k1 = 0.0;
+    double k2 = 0.0;
+    double p1 = 0.0;
+    double p2 = 0.0;
+    getDistortionCoefficients(camera, k1, k2, p1, p2);
+
+    const double x = point_camera.x() / point_camera.z();
+    const double y = point_camera.y() / point_camera.z();
+    const double r2 = x * x + y * y;
+    const double radial = 1.0 + k1 * r2 + k2 * r2 * r2;
+    const double xd = x * radial + 2.0 * p1 * x * y
+        + p2 * (r2 + 2.0 * x * x);
+    const double yd = y * radial + p1 * (r2 + 2.0 * y * y)
+        + 2.0 * p2 * x * y;
+    pixel.x = camera.fx() * xd + camera.cx();
+    pixel.y = camera.fy() * yd + camera.cy();
+}
+
+
+void collectResiduals(
+    LocalMap& local_map,
+    const CameraModel& cam0,
+    const CameraModel& cam1,
+    const Eigen::Matrix4d& T_cam1_cam0,
+    std::vector<double>& cam0_errors,
+    std::vector<double>& cam1_errors
+)
+{
+    for (const auto keyframe_id : local_map.activeKeyFrames())
+    {
+        const auto keyframe = local_map.getKeyFrame(keyframe_id);
+        if (!keyframe) continue;
+        const Eigen::Matrix4d T_C_W = keyframe->T_W_C.inverse();
+
+        for (const auto& [feature_index, map_point_id] :
+             keyframe->feature_to_mappoint)
+        {
+            const auto map_point = local_map.getMapPoint(map_point_id);
+            if (!map_point || !map_point->active ||
+                feature_index >= keyframe->features.keypoints.size())
+            {
+                continue;
+            }
+
+            const auto observation_it =
+                map_point->observations.find(keyframe_id);
+            if (observation_it == map_point->observations.end())
+            {
+                continue;
+            }
+
+            const Eigen::Vector4d X_W(
+                map_point->position_w.x(),
+                map_point->position_w.y(),
+                map_point->position_w.z(), 1.0
+            );
+            const Eigen::Vector4d X_C0 = T_C_W * X_W;
+            if (!X_C0.allFinite() || X_C0.z() <= 1e-8) continue;
+
+            cv::Point2d projected;
+            projectDistorted(X_C0, cam0, projected);
+            const auto& left = keyframe->features.keypoints[feature_index].pt;
+            cam0_errors.push_back(std::hypot(
+                projected.x - static_cast<double>(left.x),
+                projected.y - static_cast<double>(left.y)
+            ));
+
+            const auto& observation = observation_it->second;
+            if (!observation.has_stereo ||
+                !observation.right_uv.allFinite())
+            {
+                continue;
+            }
+
+            const Eigen::Vector4d X_C1 = T_cam1_cam0 * X_C0;
+            if (!X_C1.allFinite() || X_C1.z() <= 1e-8) continue;
+            projectDistorted(X_C1, cam1, projected);
+            cam1_errors.push_back(std::hypot(
+                projected.x - observation.right_uv.x(),
+                projected.y - observation.right_uv.y()
+            ));
+        }
+    }
+}
+
 } // namespace
 
 
@@ -541,7 +802,10 @@ LocalBundleAdjuster::LocalBundleAdjuster(
 BundleAdjustmentResult
 LocalBundleAdjuster::optimize(
     LocalMap& local_map,
-    const CameraModel& camera
+    const CameraModel& cam0,
+    const CameraModel& cam1,
+    const Eigen::Matrix4d& T_cam1_cam0,
+    bool optimize_points
 ) const
 {
     BundleAdjustmentResult result;
@@ -572,7 +836,7 @@ LocalBundleAdjuster::optimize(
 
     const bool has_distortion =
         getDistortionCoefficients(
-            camera,
+            cam0,
             k1,
             k2,
             p1,
@@ -666,6 +930,8 @@ LocalBundleAdjuster::optimize(
     ceres::Problem problem;
 
     std::size_t observations_used = 0;
+    std::size_t stereo_observations = 0;
+    std::size_t mono_observations = 0;
 
     // --------------------------------------------------------
     // Build reprojection observations.
@@ -743,11 +1009,32 @@ LocalBundleAdjuster::optimize(
             const Eigen::Vector4d X_C =
                 T_C_W * X_W;
 
-            if (!X_C.allFinite() ||
-                X_C.z() <= 1e-8)
+            if (!X_C.allFinite())
             {
+                ++result.skipped_nonfinite;
                 continue;
             }
+
+            if (X_C.z() <= 1e-8)
+            {
+                ++result.skipped_invalid_depth;
+                continue;
+            }
+
+            const auto observation_it =
+                map_point->observations.find(
+                    keyframe_id
+                );
+
+            if (observation_it ==
+                map_point->observations.end())
+            {
+                ++result.skipped_nonfinite;
+                continue;
+            }
+
+            const Observation& observation =
+                observation_it->second;
 
             const auto& keypoint =
                 keyframe
@@ -765,10 +1052,10 @@ LocalBundleAdjuster::optimize(
                     new ReprojectionCost(
                         keypoint.pt.x,
                         keypoint.pt.y,
-                        camera.fx(),
-                        camera.fy(),
-                        camera.cx(),
-                        camera.cy(),
+                        cam0.fx(),
+                        cam0.fy(),
+                        cam0.cx(),
+                        cam0.cy(),
                         k1,
                         k2,
                         p1,
@@ -776,12 +1063,69 @@ LocalBundleAdjuster::optimize(
                     )
                 );
 
-            problem.AddResidualBlock(
-                cost,
-                new ceres::HuberLoss(1.0),
-                pose_it->second.angle_axis,
-                point_it->second.xyz
-            );
+            if (observation.has_stereo &&
+                !observation.right_uv.allFinite())
+            {
+                ++result.skipped_nonfinite;
+                delete cost;
+                continue;
+            }
+
+            if (observation.has_stereo)
+            {
+                const Eigen::Vector4d X_C1 =
+                    T_cam1_cam0 * X_C;
+
+                if (!X_C1.allFinite())
+                {
+                    ++result.skipped_nonfinite;
+                    delete cost;
+                    continue;
+                }
+
+                if (X_C1.z() <= 1e-8)
+                {
+                    ++result.skipped_invalid_depth;
+                    delete cost;
+                    continue;
+                }
+
+                delete cost;
+
+                auto* stereo_cost =
+                    new ceres::AutoDiffCostFunction<
+                        StereoReprojectionCost,
+                        4, 6, 3
+                    >(
+                        new StereoReprojectionCost(
+                            keypoint.pt.x,
+                            keypoint.pt.y,
+                            observation.right_uv.x(),
+                            observation.right_uv.y(),
+                            cam0,
+                            cam1,
+                            T_cam1_cam0
+                        )
+                    );
+
+                problem.AddResidualBlock(
+                    stereo_cost,
+                    new ceres::HuberLoss(1.0),
+                    pose_it->second.angle_axis,
+                    point_it->second.xyz
+                );
+                ++stereo_observations;
+            }
+            else
+            {
+                problem.AddResidualBlock(
+                    cost,
+                    new ceres::HuberLoss(1.0),
+                    pose_it->second.angle_axis,
+                    point_it->second.xyz
+                );
+                ++mono_observations;
+            }
 
             ++observations_used;
         }
@@ -789,11 +1133,30 @@ LocalBundleAdjuster::optimize(
 
     result.observations_used =
         observations_used;
+    result.stereo_observations =
+        stereo_observations;
+    result.mono_observations =
+        mono_observations;
 
     if (observations_used < 10)
     {
         return result;
     }
+
+    std::vector<double> initial_cam0_errors;
+    std::vector<double> initial_cam1_errors;
+    collectResiduals(
+        local_map,
+        cam0,
+        cam1,
+        T_cam1_cam0,
+        initial_cam0_errors,
+        initial_cam1_errors
+    );
+    result.initial_cam0 =
+        summarizeResiduals(initial_cam0_errors);
+    result.initial_cam1 =
+        summarizeResiduals(initial_cam1_errors);
 
     // --------------------------------------------------------
     // Gauge fixing.
@@ -816,6 +1179,16 @@ LocalBundleAdjuster::optimize(
         );
     }
 
+    if (!optimize_points)
+    {
+        for (auto& entry : points)
+        {
+            problem.SetParameterBlockConstant(
+                entry.second.xyz
+            );
+        }
+    }
+
     // --------------------------------------------------------
     // Initial reprojection error.
     // --------------------------------------------------------
@@ -823,7 +1196,7 @@ LocalBundleAdjuster::optimize(
     result.initial_rmse_px =
         computeObservationRmse(
             local_map,
-            camera
+            cam0
         );
 
     // --------------------------------------------------------
@@ -855,8 +1228,38 @@ LocalBundleAdjuster::optimize(
     );
 
     // --------------------------------------------------------
-    // Write optimized poses back.
+    // Solver result / transactional commit barrier.
+    //
+    // IMPORTANT:
+    // Ceres optimizes temporary parameter storage. Do not
+    // mutate LocalMap unless the solution is usable.
     // --------------------------------------------------------
+
+    result.initial_cost =
+        summary.initial_cost;
+
+    result.final_cost =
+        summary.final_cost;
+
+    result.iterations =
+        static_cast<std::size_t>(
+            summary.iterations.size()
+        );
+
+    result.map_points_optimized =
+        points.size();
+
+    result.success =
+        summary.IsSolutionUsable();
+
+    if (!result.success)
+    {
+        return result;
+    }
+
+    // --------------------------------------------------------
+    // Write optimized poses back.
+    // -------------------------------------------------------- --------------------------------------------------------
 
     for (auto& [keyframe_id, pose] :
          poses)
@@ -898,12 +1301,15 @@ LocalBundleAdjuster::optimize(
             continue;
         }
 
-        map_point->position_w =
-            Eigen::Vector3d(
-                point.xyz[0],
-                point.xyz[1],
-                point.xyz[2]
-            );
+        if (optimize_points)
+        {
+            map_point->position_w =
+                Eigen::Vector3d(
+                    point.xyz[0],
+                    point.xyz[1],
+                    point.xyz[2]
+                );
+        }
     }
 
     // --------------------------------------------------------
@@ -913,25 +1319,23 @@ LocalBundleAdjuster::optimize(
     result.final_rmse_px =
         computeObservationRmse(
             local_map,
-            camera
+            cam0
         );
 
-    result.initial_cost =
-        summary.initial_cost;
-
-    result.final_cost =
-        summary.final_cost;
-
-    result.iterations =
-        static_cast<std::size_t>(
-            summary.iterations.size()
-        );
-
-    result.map_points_optimized =
-        points.size();
-
-    result.success =
-        summary.IsSolutionUsable();
+    std::vector<double> final_cam0_errors;
+    std::vector<double> final_cam1_errors;
+    collectResiduals(
+        local_map,
+        cam0,
+        cam1,
+        T_cam1_cam0,
+        final_cam0_errors,
+        final_cam1_errors
+    );
+    result.final_cam0 =
+        summarizeResiduals(final_cam0_errors);
+    result.final_cam1 =
+        summarizeResiduals(final_cam1_errors);
 
     return result;
 }

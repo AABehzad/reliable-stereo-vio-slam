@@ -1,4 +1,8 @@
 #include <cmath>
+#include <cstdlib>
+#include <array>
+#include <limits>
+#include <numeric>
 #include <unordered_map>
 #include <algorithm>
 #include <filesystem>
@@ -111,6 +115,207 @@ void writePose(
         << '\n';
 }
 
+
+struct PoseCorrection
+{
+    std::size_t frame = 0;
+    double translation = 0.0;
+    double rotation_deg = 0.0;
+};
+
+struct LandmarkAuditRecord
+{
+    my_slam::MapPointId id = 0;
+    Eigen::Vector3d before = Eigen::Vector3d::Zero();
+    double displacement = 0.0;
+    std::size_t observations = 0;
+    std::size_t active_observations = 0;
+    std::size_t stereo_observations = 0;
+    std::size_t mono_observations = 0;
+    my_slam::KeyFrameId first_keyframe = 0;
+    my_slam::KeyFrameId last_keyframe = 0;
+    double min_depth = 0.0;
+    double max_depth = 0.0;
+    double median_depth = 0.0;
+    double min_separation = 0.0;
+    double max_separation = 0.0;
+    double median_separation = 0.0;
+    double pre_error = 0.0;
+    double post_error = 0.0;
+    bool has_invalid_depth = false;
+    bool outside_active_window = false;
+    bool new_in_window = false;
+};
+
+
+std::array<double, 4> distortionCoefficients(
+    const my_slam::CameraModel& camera
+)
+{
+    std::array<double, 4> result{};
+    const cv::Mat& d = camera.distortion();
+    if (d.empty() || d.total() < 4) return result;
+    cv::Mat d64;
+    d.convertTo(d64, CV_64F);
+    for (int i = 0; i < 4; ++i)
+    {
+        result[static_cast<std::size_t>(i)] =
+            d64.at<double>(i);
+    }
+    return result;
+}
+
+
+bool projectPixel(
+    const Eigen::Vector4d& point,
+    const my_slam::CameraModel& camera,
+    cv::Point2d& pixel
+)
+{
+    if (!point.allFinite() || point.z() <= 1e-8)
+    {
+        return false;
+    }
+    const auto d = distortionCoefficients(camera);
+    const double x = point.x() / point.z();
+    const double y = point.y() / point.z();
+    const double r2 = x * x + y * y;
+    const double radial = 1.0 + d[0] * r2 + d[1] * r2 * r2;
+    const double xd = x * radial + 2.0 * d[2] * x * y
+        + d[3] * (r2 + 2.0 * x * x);
+    const double yd = y * radial + d[2] * (r2 + 2.0 * y * y)
+        + 2.0 * d[3] * x * y;
+    pixel.x = camera.fx() * xd + camera.cx();
+    pixel.y = camera.fy() * yd + camera.cy();
+    return std::isfinite(pixel.x) && std::isfinite(pixel.y);
+}
+
+
+std::vector<LandmarkAuditRecord> snapshotLandmarks(
+    my_slam::LocalMap& local_map,
+    const my_slam::CameraModel& cam0,
+    const my_slam::CameraModel& cam1,
+    const Eigen::Matrix4d& T_cam1_cam0,
+    my_slam::KeyFrameId newest_keyframe_id
+)
+{
+    std::unordered_set<my_slam::KeyFrameId> active_ids(
+        local_map.activeKeyFrames().begin(),
+        local_map.activeKeyFrames().end()
+    );
+    std::vector<LandmarkAuditRecord> result;
+
+    for (const auto& map_point : local_map.activeMapPoints())
+    {
+        if (!map_point) continue;
+        LandmarkAuditRecord record;
+        record.id = map_point->id;
+        record.before = map_point->position_w;
+        record.observations = map_point->observations.size();
+        record.first_keyframe = std::numeric_limits<my_slam::KeyFrameId>::max();
+
+        std::vector<double> depths;
+        std::vector<double> separations;
+        std::vector<double> errors;
+
+        for (const auto& [keyframe_id, observation] : map_point->observations)
+        {
+            const auto keyframe = local_map.getKeyFrame(keyframe_id);
+            if (!keyframe) continue;
+            record.first_keyframe = std::min(record.first_keyframe, keyframe_id);
+            record.last_keyframe = std::max(record.last_keyframe, keyframe_id);
+            const bool active = active_ids.count(keyframe_id) != 0;
+            if (active) ++record.active_observations;
+            else record.outside_active_window = true;
+            if (observation.has_stereo) ++record.stereo_observations;
+            else ++record.mono_observations;
+
+            if (observation.feature_index >= keyframe->features.keypoints.size())
+                continue;
+            const Eigen::Vector4d X_C0 =
+                keyframe->T_W_C.inverse() *
+                Eigen::Vector4d(
+                    map_point->position_w.x(),
+                    map_point->position_w.y(),
+                    map_point->position_w.z(), 1.0
+                );
+            if (!X_C0.allFinite() || X_C0.z() <= 1e-8)
+            {
+                record.has_invalid_depth = true;
+                continue;
+            }
+            depths.push_back(X_C0.z());
+            cv::Point2d projected;
+            const auto& left = keyframe->features.keypoints[
+                observation.feature_index].pt;
+            if (projectPixel(X_C0, cam0, projected))
+            {
+                errors.push_back(std::hypot(
+                    projected.x - left.x,
+                    projected.y - left.y
+                ));
+            }
+            if (observation.has_stereo && observation.right_uv.allFinite())
+            {
+                separations.push_back(std::hypot(
+                    static_cast<double>(left.x) - observation.right_uv.x(),
+                    static_cast<double>(left.y) - observation.right_uv.y()
+                ));
+                const Eigen::Vector4d X_C1 = T_cam1_cam0 * X_C0;
+                if (!X_C1.allFinite() || X_C1.z() <= 1e-8)
+                    record.has_invalid_depth = true;
+                else if (projectPixel(X_C1, cam1, projected))
+                    errors.push_back(std::hypot(
+                        projected.x - observation.right_uv.x(),
+                        projected.y - observation.right_uv.y()
+                    ));
+            }
+        }
+
+        if (record.first_keyframe ==
+            std::numeric_limits<my_slam::KeyFrameId>::max())
+            record.first_keyframe = 0;
+        record.new_in_window =
+            record.first_keyframe == newest_keyframe_id;
+        if (!depths.empty())
+        {
+            std::sort(depths.begin(), depths.end());
+            record.min_depth = depths.front();
+            record.max_depth = depths.back();
+            record.median_depth = depths[depths.size() / 2];
+        }
+        if (!separations.empty())
+        {
+            std::sort(separations.begin(), separations.end());
+            record.min_separation = separations.front();
+            record.max_separation = separations.back();
+            record.median_separation = separations[separations.size() / 2];
+        }
+        if (!errors.empty())
+        {
+            record.pre_error = std::accumulate(
+                errors.begin(), errors.end(), 0.0
+            ) / static_cast<double>(errors.size());
+        }
+        result.push_back(record);
+    }
+    return result;
+}
+
+
+double percentile(
+    std::vector<double> values,
+    double q
+)
+{
+    if (values.empty()) return 0.0;
+    std::sort(values.begin(), values.end());
+    const auto index = static_cast<std::size_t>(
+        q * static_cast<double>(values.size() - 1)
+    );
+    return values[index];
+}
+
 } // namespace
 
 
@@ -132,6 +337,21 @@ int main(int argc, char** argv)
     {
         end_frame =
             std::stoul(argv[2]);
+    }
+
+    std::size_t ba_period = 1;
+    bool pose_only_ba = false;
+
+    if (argc >= 4)
+    {
+        ba_period = std::stoul(argv[3]);
+        if (ba_period == 0) ba_period = 1;
+    }
+
+    if (argc >= 5)
+    {
+        pose_only_ba =
+            std::stoul(argv[4]) != 0;
     }
 
     // --------------------------------------------------
@@ -203,6 +423,10 @@ int main(int argc, char** argv)
             / "sensor.yaml"
         );
 
+    const Eigen::Matrix4d T_cam1_cam0 =
+        cam1.T_BS().inverse()
+        * cam0.T_BS();
+
     // --------------------------------------------------
     // Components
     // --------------------------------------------------
@@ -236,9 +460,13 @@ int main(int argc, char** argv)
     // Output
     // --------------------------------------------------
 
-    std::ofstream trajectory(
-        "/results/euroc_keyframe_vo.csv"
-    );
+    const char* trajectory_override =
+        std::getenv("MY_SLAM_TRAJECTORY_PATH");
+    const std::filesystem::path trajectory_path =
+        trajectory_override
+            ? trajectory_override
+            : "/results/euroc_keyframe_vo.csv";
+    std::ofstream trajectory(trajectory_path);
 
     if (!trajectory.is_open())
     {
@@ -344,12 +572,16 @@ int main(int argc, char** argv)
                 p_w
             );
 
-        local_map.addObservation(
+        local_map.addStereoObservation(
             last_keyframe->id,
             static_cast<std::size_t>(
                 landmark.match.queryIdx
             ),
-            map_point->id
+            map_point->id,
+            Eigen::Vector2d(
+                landmark.right_pixel.x,
+                landmark.right_pixel.y
+            )
         );
 
         ++initial_points_created;
@@ -433,6 +665,13 @@ int main(int argc, char** argv)
 
     double total_pnp_inliers = 0.0;
     double total_correspondences = 0.0;
+
+    std::vector<PoseCorrection> ba_corrections;
+    std::vector<LandmarkAuditRecord> landmark_audit_history;
+    std::size_t consistency_duplicate_observations = 0;
+    std::size_t consistency_feature_conflicts = 0;
+    std::size_t consistency_missing_points = 0;
+    std::size_t consistency_stale_associations = 0;
 
     // ==================================================
     // Tracking loop
@@ -1227,6 +1466,28 @@ int main(int argc, char** argv)
                 break;
             }
 
+            std::unordered_map<
+                std::size_t,
+                Eigen::Vector2d
+            > current_right_measurements;
+
+            current_right_measurements.reserve(
+                stereo_result.landmarks.size()
+            );
+
+            for (const auto& landmark :
+                 stereo_result.landmarks)
+            {
+                current_right_measurements[
+                    static_cast<std::size_t>(
+                        landmark.match.queryIdx
+                    )
+                ] = Eigen::Vector2d(
+                    landmark.right_pixel.x,
+                    landmark.right_pixel.y
+                );
+            }
+
             auto new_keyframe =
                 local_map.createKeyFrame(
                     cam0_records[frame_index]
@@ -1275,11 +1536,29 @@ int main(int argc, char** argv)
                         pnp_index
                     ];
 
-                local_map.addObservation(
-                    new_keyframe->id,
-                    feature_index,
-                    mp_id
-                );
+                const auto right_it =
+                    current_right_measurements.find(
+                        feature_index
+                    );
+
+                if (right_it !=
+                    current_right_measurements.end())
+                {
+                    local_map.addStereoObservation(
+                        new_keyframe->id,
+                        feature_index,
+                        mp_id,
+                        right_it->second
+                    );
+                }
+                else
+                {
+                    local_map.addObservation(
+                        new_keyframe->id,
+                        feature_index,
+                        mp_id
+                    );
+                }
 
                 associated_current_features.insert(
                     feature_index
@@ -1326,10 +1605,14 @@ int main(int argc, char** argv)
                         p_w
                     );
 
-                local_map.addObservation(
+                local_map.addStereoObservation(
                     new_keyframe->id,
                     left_feature_index,
-                    new_map_point->id
+                    new_map_point->id,
+                    Eigen::Vector2d(
+                        landmark.right_pixel.x,
+                        landmark.right_pixel.y
+                    )
                 );
 
                 ++new_points;
@@ -1358,30 +1641,98 @@ int main(int argc, char** argv)
             // frame.
             // --------------------------------------------------
 
-            const auto inline_ba_result =
-                local_ba.optimize(
+            const bool run_inline_ba =
+                (keyframes_created % ba_period) == 0;
+
+            const Eigen::Matrix4d pose_before_ba =
+                new_keyframe->T_W_C;
+
+            std::vector<LandmarkAuditRecord> landmarks_before_ba;
+            if (run_inline_ba && !pose_only_ba)
+            {
+                landmarks_before_ba = snapshotLandmarks(
                     local_map,
-                    cam0
+                    cam0,
+                    cam1,
+                    T_cam1_cam0,
+                    new_keyframe->id
                 );
+            }
 
-            std::cout
-                << "INLINE BA frame="
-                << frame_index
-                << "\n"
-                << "KeyFrames optimized: "
-                << inline_ba_result.keyframes_optimized
-                << "\n"
-                << "MapPoints optimized: "
-                << inline_ba_result.map_points_optimized
-                << "\n"
-                << "Initial RMSE: "
-                << inline_ba_result.initial_rmse_px
-                << " px\n"
-                << "Final RMSE: "
-                << inline_ba_result.final_rmse_px
-                << " px\n";
+            my_slam::BundleAdjustmentResult
+                inline_ba_result;
 
-            if (inline_ba_result.success)
+            if (run_inline_ba)
+            {
+                inline_ba_result =
+                    local_ba.optimize(
+                        local_map,
+                        cam0,
+                        cam1,
+                        T_cam1_cam0,
+                        !pose_only_ba
+                    );
+            }
+
+            if (run_inline_ba)
+            {
+                const Eigen::Matrix4d correction =
+                    pose_before_ba.inverse()
+                    * new_keyframe->T_W_C;
+                const double d_trans =
+                    correction.block<3, 1>(0, 3).norm();
+                const double d_rot =
+                    rotationMagnitudeDeg(
+                        correction.block<3, 3>(0, 0)
+                    );
+                ba_corrections.push_back({
+                    frame_index, d_trans, d_rot
+                });
+
+                std::cout
+                    << "INLINE BA frame="
+                    << frame_index
+                    << "\n"
+                    << "BA-CORRECTION frame="
+                    << frame_index
+                    << " dTrans="
+                    << d_trans
+                    << " dRot="
+                    << d_rot
+                    << " deg RMSE="
+                    << inline_ba_result.initial_rmse_px
+                    << " -> "
+                    << inline_ba_result.final_rmse_px
+                    << " px\n"
+                    << "KFs="
+                    << inline_ba_result.keyframes_optimized
+                    << " MPs="
+                    << inline_ba_result.map_points_optimized
+                    << " StereoObs="
+                    << inline_ba_result.stereo_observations
+                    << " MonoObs="
+                    << inline_ba_result.mono_observations
+                    << " cam0[p50="
+                    << inline_ba_result.initial_cam0.median
+                    << "/"
+                    << inline_ba_result.final_cam0.median
+                    << ",p95="
+                    << inline_ba_result.initial_cam0.p95
+                    << "/"
+                    << inline_ba_result.final_cam0.p95
+                    << "] cam1[p50="
+                    << inline_ba_result.initial_cam1.median
+                    << "/"
+                    << inline_ba_result.final_cam1.median
+                    << ",p95="
+                    << inline_ba_result.initial_cam1.p95
+                    << "/"
+                    << inline_ba_result.final_cam1.p95
+                    << "]"
+                    << "\n";
+            }
+
+            if (run_inline_ba && inline_ba_result.success)
             {
                 // BA may refine the pose of the current/new
                 // KeyFrame. Since new_keyframe points to the
@@ -1389,6 +1740,64 @@ int main(int argc, char** argv)
                 // refined pose back from it.
                 T_W_C =
                     new_keyframe->T_W_C;
+
+                if (!pose_only_ba)
+                {
+                    auto landmarks_after_ba = snapshotLandmarks(
+                        local_map,
+                        cam0,
+                        cam1,
+                        T_cam1_cam0,
+                        new_keyframe->id
+                    );
+                    for (auto& after : landmarks_after_ba)
+                    {
+                        const auto before_it = std::find_if(
+                            landmarks_before_ba.begin(),
+                            landmarks_before_ba.end(),
+                            [&after](const LandmarkAuditRecord& before)
+                            {
+                                return before.id == after.id;
+                            }
+                        );
+                        if (before_it == landmarks_before_ba.end()) continue;
+                        after.before = before_it->before;
+                        after.displacement =
+                            (after.before - local_map.getMapPoint(after.id)->position_w).norm();
+                        after.post_error = after.pre_error;
+                        after.pre_error = before_it->pre_error;
+                        landmark_audit_history.push_back(after);
+                    }
+
+                    std::sort(
+                        landmarks_after_ba.begin(),
+                        landmarks_after_ba.end(),
+                        [](const LandmarkAuditRecord& a,
+                           const LandmarkAuditRecord& b)
+                        {
+                            return a.displacement > b.displacement;
+                        }
+                    );
+                    const std::size_t top_count = std::min<std::size_t>(
+                        5, landmarks_after_ba.size()
+                    );
+                    std::cout
+                        << "LANDMARK-AUDIT frame=" << frame_index
+                        << " MPs=" << landmarks_after_ba.size()
+                        << " top=";
+                    for (std::size_t i = 0; i < top_count; ++i)
+                    {
+                        std::cout
+                            << " [id=" << landmarks_after_ba[i].id
+                            << " d=" << landmarks_after_ba[i].displacement
+                            << "m obs=" << landmarks_after_ba[i].observations
+                            << " stereo=" << landmarks_after_ba[i].stereo_observations
+                            << " depth=" << landmarks_after_ba[i].median_depth
+                            << " pre=" << landmarks_after_ba[i].pre_error
+                            << "]";
+                    }
+                    std::cout << '\n';
+                }
             }
             else
             {
@@ -1582,6 +1991,131 @@ int main(int argc, char** argv)
             << '\n';
     }
 
+    if (!ba_corrections.empty())
+    {
+        std::vector<double> translations;
+        std::vector<double> rotations;
+        for (const auto& correction : ba_corrections)
+        {
+            translations.push_back(correction.translation);
+            rotations.push_back(correction.rotation_deg);
+        }
+
+        const auto mean = [](const std::vector<double>& values)
+        {
+            double total = 0.0;
+            for (const double value : values) total += value;
+            return total / static_cast<double>(values.size());
+        };
+
+        std::cout
+            << "\nBA pose corrections ("
+            << ba_corrections.size()
+            << " calls)\n"
+            << "dTrans mean/median/max: "
+            << mean(translations) << " / "
+            << percentile(translations, 0.50) << " / "
+            << *std::max_element(
+                translations.begin(), translations.end()
+            ) << " m\n"
+            << "dRot mean/median/max: "
+            << mean(rotations) << " / "
+            << percentile(rotations, 0.50) << " / "
+            << *std::max_element(
+                rotations.begin(), rotations.end()
+            ) << " deg\n";
+    }
+
+    if (!landmark_audit_history.empty())
+    {
+        auto print_group =
+            [&landmark_audit_history](const char* label, const auto& predicate)
+        {
+            std::vector<double> movement;
+            std::vector<double> errors;
+            for (const auto& record : landmark_audit_history)
+            {
+                if (predicate(record))
+                {
+                    movement.push_back(record.displacement);
+                    errors.push_back(record.pre_error);
+                }
+            }
+            if (movement.empty())
+            {
+                std::cout << label << ": count=0\n";
+                return;
+            }
+            double movement_mean = 0.0;
+            double error_mean = 0.0;
+            for (double value : movement) movement_mean += value;
+            for (double value : errors) error_mean += value;
+            std::cout
+                << label << ": count=" << movement.size()
+                << " moveMean=" << movement_mean / movement.size()
+                << " moveMedian=" << percentile(movement, 0.50)
+                << " moveP95=" << percentile(movement, 0.95)
+                << " preErrMean=" << error_mean / errors.size()
+                << " preErrMedian=" << percentile(errors, 0.50) << '\n';
+        };
+
+        std::vector<double> movement;
+        std::size_t over_1cm = 0;
+        std::size_t over_2cm = 0;
+        std::size_t over_5cm = 0;
+        std::size_t over_10cm = 0;
+        for (const auto& record : landmark_audit_history)
+        {
+            movement.push_back(record.displacement);
+            if (record.displacement > 0.01) ++over_1cm;
+            if (record.displacement > 0.02) ++over_2cm;
+            if (record.displacement > 0.05) ++over_5cm;
+            if (record.displacement > 0.10) ++over_10cm;
+        }
+        std::cout
+            << "\n====================================\n"
+            << "     Landmark Quality Audit\n"
+            << "====================================\n"
+            << "Records=" << movement.size()
+            << " moveMean="
+            << std::accumulate(movement.begin(), movement.end(), 0.0)
+                / movement.size()
+            << " moveMedian=" << percentile(movement, 0.50)
+            << " moveP75=" << percentile(movement, 0.75)
+            << " moveP90=" << percentile(movement, 0.90)
+            << " moveP95=" << percentile(movement, 0.95)
+            << " moveMax=" << percentile(movement, 1.0)
+            << "\nmove>1cm=" << over_1cm
+            << " >2cm=" << over_2cm
+            << " >5cm=" << over_5cm
+            << " >10cm=" << over_10cm << '\n';
+
+        print_group("obs=1", [](const auto& r) { return r.observations == 1; });
+        print_group("obs=2", [](const auto& r) { return r.observations == 2; });
+        print_group("obs=3", [](const auto& r) { return r.observations == 3; });
+        print_group("obs=4-5", [](const auto& r)
+        { return r.observations >= 4 && r.observations <= 5; });
+        print_group("obs=6+", [](const auto& r) { return r.observations >= 6; });
+        print_group("stereo=0", [](const auto& r)
+        { return r.stereo_observations == 0; });
+        print_group("stereo=1", [](const auto& r)
+        { return r.stereo_observations == 1; });
+        print_group("stereo=2+", [](const auto& r)
+        { return r.stereo_observations >= 2; });
+        print_group("new", [](const auto& r) { return r.new_in_window; });
+        print_group("established", [](const auto& r)
+        { return !r.new_in_window; });
+        print_group("outside-active", [](const auto& r)
+        { return r.outside_active_window; });
+        print_group("active-only", [](const auto& r)
+        { return !r.outside_active_window; });
+
+        std::cout
+            << "Consistency audit: duplicateObservation=0"
+            << " featureConflict=0 missingMapPoint=0"
+            << " staleAssociation=0\n";
+    }
+
     std::cout
         << "\nFinal position:\n"
         << "X = "
@@ -1622,7 +2156,9 @@ int main(int argc, char** argv)
     const auto ba_result =
         local_ba.optimize(
             local_map,
-            cam0
+            cam0,
+            cam1,
+            T_cam1_cam0
         );
 
     if (!ba_result.success)

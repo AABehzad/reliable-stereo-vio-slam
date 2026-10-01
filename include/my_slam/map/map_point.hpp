@@ -16,6 +16,10 @@ struct Observation
 {
     KeyFrameId keyframe_id = 0;
     std::size_t feature_index = 0;
+
+    bool has_stereo = false;
+    Eigen::Vector2d right_uv =
+        Eigen::Vector2d::Zero();
 };
 
 struct MapPoint
