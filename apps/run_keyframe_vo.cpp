@@ -22,6 +22,7 @@
 
 #include "my_slam/camera/camera_model.hpp"
 #include "my_slam/backend/local_bundle_adjuster.hpp"
+#include "my_slam/backend/pose_graph_optimizer.hpp"
 #include "my_slam/frontend/feature_matcher.hpp"
 #include "my_slam/frontend/local_map_tracker.hpp"
 #include "my_slam/frontend/orb_extractor.hpp"
@@ -472,6 +473,8 @@ int main(int argc, char** argv)
     std::size_t loop_rejected = 0;
     int loop_best_descriptor_matches = 0;
     int loop_best_geometric_inliers = 0;
+    std::vector<my_slam::LoopConstraint>
+        accepted_loop_constraints;
 
     // Sliding local map containing at most 7 active KFs.
     my_slam::LocalMap local_map(7);
@@ -1869,6 +1872,7 @@ int main(int argc, char** argv)
 
             for (const auto& loop : loop_result.verified_loops)
             {
+                accepted_loop_constraints.push_back(loop);
                 const auto candidate_keyframe =
                     local_map.getKeyFrame(loop.candidate_keyframe_id);
                 const Eigen::Quaterniond relative_q(
@@ -2330,6 +2334,73 @@ int main(int argc, char** argv)
 
         std::cout
             << "Local BA completed.\n";
+    }
+
+    if (!accepted_loop_constraints.empty())
+    {
+        my_slam::PoseGraphOptimizer pose_graph_optimizer;
+        const auto pose_graph_result =
+            pose_graph_optimizer.optimize(
+                local_map,
+                accepted_loop_constraints
+            );
+
+        if (pose_graph_result.success)
+        {
+            std::ofstream pose_graph_trajectory(
+                "/results/euroc_pose_graph_trajectory.csv"
+            );
+            pose_graph_trajectory
+                << "frame,timestamp_ns,x_m,y_m,z_m,qx,qy,qz,qw\n";
+            for (std::size_t id = 0;
+                 id < local_map.keyFrameCount();
+                 ++id)
+            {
+                const auto keyframe =
+                    local_map.getKeyFrame(
+                        static_cast<my_slam::KeyFrameId>(id)
+                    );
+                if (!keyframe) continue;
+                writePose(
+                    pose_graph_trajectory,
+                    id,
+                    keyframe->timestamp_ns,
+                    keyframe->T_W_C
+                );
+            }
+            pose_graph_trajectory.close();
+
+            std::cout
+                << "\n====================================\n"
+                << "       Pose Graph Optimization\n"
+                << "====================================\n"
+                << "Nodes: " << pose_graph_result.nodes << '\n'
+                << "Odometry edges: "
+                << pose_graph_result.odometry_edges << '\n'
+                << "Loop edges: "
+                << pose_graph_result.loop_edges << '\n'
+                << "Before trajectory length: "
+                << pose_graph_result.trajectory_length_before << " m\n"
+                << "After trajectory length: "
+                << pose_graph_result.trajectory_length_after << " m\n"
+                << "Mean translation correction: "
+                << pose_graph_result.mean_translation_correction << " m\n"
+                << "Max translation correction: "
+                << pose_graph_result.max_translation_correction << " m\n"
+                << "Mean rotation correction: "
+                << pose_graph_result.mean_rotation_correction_deg << " deg\n"
+                << "Max rotation correction: "
+                << pose_graph_result.max_rotation_correction_deg << " deg\n"
+                << "Iterations: " << pose_graph_result.iterations << '\n'
+                << "Initial cost: " << pose_graph_result.initial_cost << '\n'
+                << "Final cost: " << pose_graph_result.final_cost << '\n'
+                << "Trajectory: /results/euroc_pose_graph_trajectory.csv\n";
+        }
+        else
+        {
+            std::cerr << "Pose graph optimization failed; no corrected "
+                         "trajectory written.\n";
+        }
     }
 
 
