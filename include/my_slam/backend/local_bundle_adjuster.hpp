@@ -25,6 +25,41 @@ struct ResidualDistribution
     std::size_t over_5px = 0;
 };
 
+enum class LandmarkReliabilityMode
+{
+    Standard = 0,
+    ActiveWindow = 1,
+    NoWindowAblation = 2
+};
+
+struct LandmarkReliability
+{
+    MapPointId id = 0;
+    double q = 0.0;
+    double q_obs = 0.0;
+    double q_stereo = 0.0;
+    double q_reproj = 0.0;
+    double q_window = 0.0;
+    std::size_t n_total = 0;
+    std::size_t n_active = 0;
+    std::size_t n_stereo_active = 0;
+};
+
+struct LandmarkReliabilitySummary
+{
+    std::size_t count = 0;
+    double mean = 0.0;
+    double median = 0.0;
+    double p10 = 0.0;
+    double p25 = 0.0;
+    double p75 = 0.0;
+    double p90 = 0.0;
+    double mean_q_obs = 0.0;
+    double mean_q_stereo = 0.0;
+    double mean_q_reproj = 0.0;
+    double mean_q_window = 0.0;
+};
+
 struct BundleAdjustmentResult
 {
     bool success = false;
@@ -36,6 +71,10 @@ struct BundleAdjustmentResult
     std::size_t mono_observations = 0;
     std::size_t skipped_invalid_depth = 0;
     std::size_t skipped_nonfinite = 0;
+    std::size_t quarantined_landmarks = 0;
+
+    LandmarkReliabilitySummary reliability_summary;
+    std::vector<LandmarkReliability> landmark_reliabilities;
 
     ResidualDistribution initial_cam0;
     ResidualDistribution final_cam0;
@@ -63,7 +102,9 @@ public:
         const CameraModel& cam0,
         const CameraModel& cam1,
         const Eigen::Matrix4d& T_cam1_cam0,
-        bool optimize_points = true
+        bool optimize_points = true,
+        LandmarkReliabilityMode reliability_mode =
+            LandmarkReliabilityMode::Standard
     ) const;
 
 private:

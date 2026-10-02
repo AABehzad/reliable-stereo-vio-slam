@@ -144,6 +144,8 @@ struct LandmarkAuditRecord
     double median_separation = 0.0;
     double pre_error = 0.0;
     double post_error = 0.0;
+    double reliability_q = 0.0;
+    bool has_reliability = false;
     bool has_invalid_depth = false;
     bool outside_active_window = false;
     bool new_in_window = false;
@@ -343,6 +345,8 @@ int main(int argc, char** argv)
 
     std::size_t ba_period = 1;
     bool pose_only_ba = false;
+    my_slam::LandmarkReliabilityMode reliability_mode =
+        my_slam::LandmarkReliabilityMode::Standard;
 
     if (argc >= 4)
     {
@@ -354,6 +358,12 @@ int main(int argc, char** argv)
     {
         pose_only_ba =
             std::stoul(argv[4]) != 0;
+    }
+    if (argc >= 6)
+    {
+        const auto mode = std::stoul(argv[5]);
+        if (mode <= 2)
+            reliability_mode = static_cast<my_slam::LandmarkReliabilityMode>(mode);
     }
 
     // --------------------------------------------------
@@ -488,7 +498,13 @@ int main(int argc, char** argv)
     const std::filesystem::path trajectory_path =
         trajectory_override
             ? trajectory_override
-            : "/results/euroc_keyframe_vo.csv";
+            : pose_only_ba
+                ? "/results/euroc_pose_only_reference.csv"
+                : reliability_mode == my_slam::LandmarkReliabilityMode::ActiveWindow
+                    ? "/results/euroc_joint_ba_reliability.csv"
+                    : reliability_mode == my_slam::LandmarkReliabilityMode::NoWindowAblation
+                        ? "/results/euroc_joint_ba_no_window.csv"
+                        : "/results/euroc_joint_ba_standard.csv";
     std::ofstream trajectory(trajectory_path);
 
     if (!trajectory.is_open())
@@ -1693,12 +1709,26 @@ int main(int argc, char** argv)
                         cam0,
                         cam1,
                         T_cam1_cam0,
-                        !pose_only_ba
+                        !pose_only_ba,
+                        reliability_mode
                     );
             }
 
             if (run_inline_ba)
             {
+                for (auto& record : landmarks_before_ba)
+                {
+                    const auto it = std::find_if(
+                        inline_ba_result.landmark_reliabilities.begin(),
+                        inline_ba_result.landmark_reliabilities.end(),
+                        [&record](const my_slam::LandmarkReliability& item)
+                        { return item.id == record.id; });
+                    if (it != inline_ba_result.landmark_reliabilities.end())
+                    {
+                        record.reliability_q = it->q;
+                        record.has_reliability = true;
+                    }
+                }
                 const Eigen::Matrix4d correction =
                     pose_before_ba.inverse()
                     * new_keyframe->T_W_C;
@@ -1735,8 +1765,27 @@ int main(int argc, char** argv)
                     << inline_ba_result.stereo_observations
                     << " MonoObs="
                     << inline_ba_result.mono_observations
-                    << " cam0[p50="
-                    << inline_ba_result.initial_cam0.median
+                    << " quarantined="
+                    << inline_ba_result.quarantined_landmarks
+                    << " Q[count="
+                    << inline_ba_result.reliability_summary.count
+                    << ",mean="
+                    << inline_ba_result.reliability_summary.mean
+                    << ",p10="
+                    << inline_ba_result.reliability_summary.p10
+                    << ",median="
+                    << inline_ba_result.reliability_summary.median
+                    << ",p90="
+                    << inline_ba_result.reliability_summary.p90
+                    << "] components[obs="
+                    << inline_ba_result.reliability_summary.mean_q_obs
+                    << ",stereo="
+                    << inline_ba_result.reliability_summary.mean_q_stereo
+                    << ",reproj="
+                    << inline_ba_result.reliability_summary.mean_q_reproj
+                    << ",window="
+                    << inline_ba_result.reliability_summary.mean_q_window
+                    << "] cam0[p50="
                     << "/"
                     << inline_ba_result.final_cam0.median
                     << ",p95="
@@ -1785,6 +1834,8 @@ int main(int argc, char** argv)
                         );
                         if (before_it == landmarks_before_ba.end()) continue;
                         after.before = before_it->before;
+                        after.reliability_q = before_it->reliability_q;
+                        after.has_reliability = before_it->has_reliability;
                         after.displacement =
                             (after.before - local_map.getMapPoint(after.id)->position_w).norm();
                         after.post_error = after.pre_error;
@@ -2178,22 +2229,23 @@ int main(int argc, char** argv)
                 << " moveMean=" << movement_mean / movement.size()
                 << " moveMedian=" << percentile(movement, 0.50)
                 << " moveP95=" << percentile(movement, 0.95)
+                << " moveMax=" << percentile(movement, 1.0)
                 << " preErrMean=" << error_mean / errors.size()
                 << " preErrMedian=" << percentile(errors, 0.50) << '\n';
         };
 
         std::vector<double> movement;
         std::size_t over_1cm = 0;
-        std::size_t over_2cm = 0;
-        std::size_t over_5cm = 0;
         std::size_t over_10cm = 0;
+        std::size_t over_1m = 0;
+        std::size_t over_10m = 0;
         for (const auto& record : landmark_audit_history)
         {
             movement.push_back(record.displacement);
             if (record.displacement > 0.01) ++over_1cm;
-            if (record.displacement > 0.02) ++over_2cm;
-            if (record.displacement > 0.05) ++over_5cm;
             if (record.displacement > 0.10) ++over_10cm;
+            if (record.displacement > 1.0) ++over_1m;
+            if (record.displacement > 10.0) ++over_10m;
         }
         std::cout
             << "\n====================================\n"
@@ -2208,10 +2260,10 @@ int main(int argc, char** argv)
             << " moveP90=" << percentile(movement, 0.90)
             << " moveP95=" << percentile(movement, 0.95)
             << " moveMax=" << percentile(movement, 1.0)
-            << "\nmove>1cm=" << over_1cm
-            << " >2cm=" << over_2cm
-            << " >5cm=" << over_5cm
-            << " >10cm=" << over_10cm << '\n';
+            << "\nmove>0.01m=" << over_1cm
+            << " >0.10m=" << over_10cm
+            << " >1.0m=" << over_1m
+            << " >10.0m=" << over_10m << '\n';
 
         print_group("obs=1", [](const auto& r) { return r.observations == 1; });
         print_group("obs=2", [](const auto& r) { return r.observations == 2; });
@@ -2232,6 +2284,16 @@ int main(int argc, char** argv)
         { return r.outside_active_window; });
         print_group("active-only", [](const auto& r)
         { return !r.outside_active_window; });
+        print_group("Q<0.2", [](const auto& r)
+        { return r.has_reliability && r.reliability_q < 0.2; });
+        print_group("Q=0.2-0.4", [](const auto& r)
+        { return r.has_reliability && r.reliability_q >= 0.2 && r.reliability_q < 0.4; });
+        print_group("Q=0.4-0.6", [](const auto& r)
+        { return r.has_reliability && r.reliability_q >= 0.4 && r.reliability_q < 0.6; });
+        print_group("Q=0.6-0.8", [](const auto& r)
+        { return r.has_reliability && r.reliability_q >= 0.6 && r.reliability_q < 0.8; });
+        print_group("Q>=0.8", [](const auto& r)
+        { return r.has_reliability && r.reliability_q >= 0.8; });
 
         std::cout
             << "Consistency audit: duplicateObservation=0"
@@ -2253,7 +2315,7 @@ int main(int argc, char** argv)
 
     std::cout
         << "\nTrajectory:\n"
-        << "/results/euroc_keyframe_vo.csv\n";
+        << trajectory_path.string() << '\n';
 
     if (successful_frames == 0)
     {
@@ -2281,7 +2343,9 @@ int main(int argc, char** argv)
             local_map,
             cam0,
             cam1,
-            T_cam1_cam0
+            T_cam1_cam0,
+            !pose_only_ba,
+            reliability_mode
         );
 
     if (!ba_result.success)
@@ -2300,7 +2364,22 @@ int main(int argc, char** argv)
         std::cout
             << "MapPoints optimized  : "
             << ba_result.map_points_optimized
-            << '\n';
+            << '\n'
+            << "Quarantined landmarks: "
+            << ba_result.quarantined_landmarks
+            << '\n'
+            << "Reliability Q mean/median/p10/p25/p75/p90: "
+            << ba_result.reliability_summary.mean << " / "
+            << ba_result.reliability_summary.median << " / "
+            << ba_result.reliability_summary.p10 << " / "
+            << ba_result.reliability_summary.p25 << " / "
+            << ba_result.reliability_summary.p75 << " / "
+            << ba_result.reliability_summary.p90 << '\n'
+            << "Reliability components q_obs/q_stereo/q_reproj/q_window: "
+            << ba_result.reliability_summary.mean_q_obs << " / "
+            << ba_result.reliability_summary.mean_q_stereo << " / "
+            << ba_result.reliability_summary.mean_q_reproj << " / "
+            << ba_result.reliability_summary.mean_q_window << '\n';
 
         std::cout
             << "Observations used    : "

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <numeric>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <ceres/ceres.h>
@@ -30,6 +31,20 @@ struct PointBlock
 {
     double xyz[3] = {0.0, 0.0, 0.0};
 };
+
+struct ReliabilityConfig
+{
+    double obs_scale = 3.0;
+    double reprojection_scale_px = 2.0;
+    double min_q = 0.05;
+    double huber_scale = 1.0;
+    double obs_weight = 0.20;
+    double stereo_weight = 0.25;
+    double reprojection_weight = 0.35;
+    double window_weight = 0.20;
+};
+
+constexpr ReliabilityConfig kReliabilityConfig{};
 
 bool getDistortionCoefficients(
     const CameraModel& camera,
@@ -788,6 +803,140 @@ void collectResiduals(
     }
 }
 
+
+struct ReliabilityObservation
+{
+    bool valid = false;
+    bool stereo = false;
+    bool active = false;
+    double rmse = 0.0;
+};
+
+ReliabilityObservation evaluateReliabilityObservation(
+    const MapPoint& map_point,
+    KeyFrameId keyframe_id,
+    const KeyFrame& keyframe,
+    const CameraModel& cam0,
+    const CameraModel& cam1,
+    const Eigen::Matrix4d& T_cam1_cam0,
+    const std::unordered_set<KeyFrameId>& active_ids
+)
+{
+    ReliabilityObservation result;
+    const auto observation_it = map_point.observations.find(keyframe_id);
+    if (observation_it == map_point.observations.end()) return result;
+    const auto& observation = observation_it->second;
+    if (observation.feature_index >= keyframe.features.keypoints.size())
+        return result;
+
+    const Eigen::Vector4d X_W(
+        map_point.position_w.x(), map_point.position_w.y(),
+        map_point.position_w.z(), 1.0);
+    const Eigen::Vector4d X_C0 = keyframe.T_W_C.inverse() * X_W;
+    if (!X_C0.allFinite() || X_C0.z() <= 1e-8) return result;
+
+    cv::Point2d left_projected;
+    projectDistorted(X_C0, cam0, left_projected);
+    if (!std::isfinite(left_projected.x) ||
+        !std::isfinite(left_projected.y)) return result;
+    const auto& left = keyframe.features.keypoints[observation.feature_index].pt;
+    const double left_sq =
+        std::pow(left_projected.x - static_cast<double>(left.x), 2.0) +
+        std::pow(left_projected.y - static_cast<double>(left.y), 2.0);
+
+    double squared_sum = left_sq;
+    std::size_t component_count = 2;
+    if (observation.has_stereo)
+    {
+        if (!observation.right_uv.allFinite()) return result;
+        const Eigen::Vector4d X_C1 = T_cam1_cam0 * X_C0;
+        if (!X_C1.allFinite() || X_C1.z() <= 1e-8) return result;
+        cv::Point2d right_projected;
+        projectDistorted(X_C1, cam1, right_projected);
+        if (!std::isfinite(right_projected.x) ||
+            !std::isfinite(right_projected.y)) return result;
+        squared_sum +=
+            std::pow(right_projected.x - observation.right_uv.x(), 2.0) +
+            std::pow(right_projected.y - observation.right_uv.y(), 2.0);
+        component_count = 4;
+    }
+
+    result.valid = true;
+    result.stereo = observation.has_stereo;
+    result.active = active_ids.count(keyframe_id) != 0;
+    result.rmse = std::sqrt(squared_sum / static_cast<double>(component_count));
+    return result;
+}
+
+std::vector<LandmarkReliability> computeLandmarkReliabilities(
+    const std::vector<std::shared_ptr<MapPoint>>& map_points,
+    LocalMap& local_map,
+    const CameraModel& cam0,
+    const CameraModel& cam1,
+    const Eigen::Matrix4d& T_cam1_cam0,
+    std::size_t& quarantined
+)
+{
+    std::unordered_set<KeyFrameId> active_ids(
+        local_map.activeKeyFrames().begin(), local_map.activeKeyFrames().end());
+    std::vector<LandmarkReliability> result;
+    quarantined = 0;
+    for (const auto& point : map_points)
+    {
+        if (!point || !point->position_w.allFinite())
+        {
+            ++quarantined;
+            continue;
+        }
+        LandmarkReliability item;
+        item.id = point->id;
+        std::vector<double> active_errors;
+        for (const auto& [keyframe_id, unused] : point->observations)
+        {
+            const auto keyframe = local_map.getKeyFrame(keyframe_id);
+            if (!keyframe) continue;
+            const auto observation = evaluateReliabilityObservation(
+                *point, keyframe_id, *keyframe, cam0, cam1,
+                T_cam1_cam0, active_ids);
+            if (!observation.valid) continue;
+            ++item.n_total;
+            if (observation.active)
+            {
+                ++item.n_active;
+                if (observation.stereo) ++item.n_stereo_active;
+                active_errors.push_back(observation.rmse);
+            }
+        }
+        if (item.n_active == 0 || active_errors.empty())
+        {
+            ++quarantined;
+            continue;
+        }
+        std::sort(active_errors.begin(), active_errors.end());
+        const double median_reproj = active_errors[active_errors.size() / 2];
+        if (!std::isfinite(median_reproj))
+        {
+            ++quarantined;
+            continue;
+        }
+        item.q_obs = std::min(1.0, static_cast<double>(item.n_active) /
+            kReliabilityConfig.obs_scale);
+        item.q_stereo = static_cast<double>(item.n_stereo_active) /
+            static_cast<double>(std::max<std::size_t>(1, item.n_active));
+        item.q_reproj = std::exp(-0.5 * std::pow(
+            median_reproj / kReliabilityConfig.reprojection_scale_px, 2.0));
+        item.q_window = static_cast<double>(item.n_active) /
+            static_cast<double>(std::max<std::size_t>(1, item.n_total));
+        item.q = kReliabilityConfig.obs_weight * item.q_obs +
+            kReliabilityConfig.stereo_weight * item.q_stereo +
+            kReliabilityConfig.reprojection_weight * item.q_reproj +
+            kReliabilityConfig.window_weight * item.q_window;
+        item.q = std::clamp(item.q, kReliabilityConfig.min_q, 1.0);
+        result.push_back(item);
+    }
+    return result;
+}
+
 } // namespace
 
 
@@ -805,7 +954,8 @@ LocalBundleAdjuster::optimize(
     const CameraModel& cam0,
     const CameraModel& cam1,
     const Eigen::Matrix4d& T_cam1_cam0,
-    bool optimize_points
+    bool optimize_points,
+    LandmarkReliabilityMode reliability_mode
 ) const
 {
     BundleAdjustmentResult result;
@@ -878,6 +1028,64 @@ LocalBundleAdjuster::optimize(
         active_map_points.size()
     );
 
+    result.landmark_reliabilities = computeLandmarkReliabilities(
+        active_map_points, local_map, cam0, cam1, T_cam1_cam0,
+        result.quarantined_landmarks);
+    if (reliability_mode == LandmarkReliabilityMode::NoWindowAblation)
+    {
+        constexpr double remaining_weight =
+            kReliabilityConfig.obs_weight +
+            kReliabilityConfig.stereo_weight +
+            kReliabilityConfig.reprojection_weight;
+        for (auto& reliability : result.landmark_reliabilities)
+        {
+            reliability.q = std::clamp((
+                kReliabilityConfig.obs_weight * reliability.q_obs +
+                kReliabilityConfig.stereo_weight * reliability.q_stereo +
+                kReliabilityConfig.reprojection_weight *
+                    reliability.q_reproj) / remaining_weight,
+                kReliabilityConfig.min_q, 1.0);
+        }
+    }
+    result.reliability_summary.count =
+        result.landmark_reliabilities.size();
+    std::vector<double> q_values;
+    q_values.reserve(result.landmark_reliabilities.size());
+    for (const auto& reliability : result.landmark_reliabilities)
+    {
+        q_values.push_back(reliability.q);
+        result.reliability_summary.mean += reliability.q;
+        result.reliability_summary.mean_q_obs += reliability.q_obs;
+        result.reliability_summary.mean_q_stereo += reliability.q_stereo;
+        result.reliability_summary.mean_q_reproj += reliability.q_reproj;
+        result.reliability_summary.mean_q_window += reliability.q_window;
+    }
+    if (!q_values.empty())
+    {
+        std::sort(q_values.begin(), q_values.end());
+        const auto quantile = [&q_values](double q)
+        {
+            return q_values[static_cast<std::size_t>(
+                q * static_cast<double>(q_values.size() - 1))];
+        };
+        result.reliability_summary.median = quantile(0.50);
+        result.reliability_summary.p10 = quantile(0.10);
+        result.reliability_summary.p25 = quantile(0.25);
+        result.reliability_summary.p75 = quantile(0.75);
+        result.reliability_summary.p90 = quantile(0.90);
+        const double count = static_cast<double>(q_values.size());
+        result.reliability_summary.mean /= count;
+        result.reliability_summary.mean_q_obs /= count;
+        result.reliability_summary.mean_q_stereo /= count;
+        result.reliability_summary.mean_q_reproj /= count;
+        result.reliability_summary.mean_q_window /= count;
+    }
+
+    std::unordered_map<MapPointId, double> landmark_q;
+    landmark_q.reserve(result.landmark_reliabilities.size());
+    for (const auto& reliability : result.landmark_reliabilities)
+        landmark_q.emplace(reliability.id, reliability.q);
+
     for (const auto keyframe_id :
          active_keyframes)
     {
@@ -906,6 +1114,11 @@ LocalBundleAdjuster::optimize(
          active_map_points)
     {
         if (!map_point)
+        {
+            continue;
+        }
+
+        if (landmark_q.find(map_point->id) == landmark_q.end())
         {
             continue;
         }
@@ -1108,20 +1321,28 @@ LocalBundleAdjuster::optimize(
                         )
                     );
 
+                const double q = landmark_q.at(map_point_id);
+                ceres::LossFunction* loss = new ceres::HuberLoss(
+                    kReliabilityConfig.huber_scale);
+                if (reliability_mode != LandmarkReliabilityMode::Standard)
+                    loss = new ceres::ScaledLoss(
+                        loss, q, ceres::TAKE_OWNERSHIP);
                 problem.AddResidualBlock(
-                    stereo_cost,
-                    new ceres::HuberLoss(1.0),
-                    pose_it->second.angle_axis,
+                    stereo_cost, loss, pose_it->second.angle_axis,
                     point_it->second.xyz
                 );
                 ++stereo_observations;
             }
             else
             {
+                const double q = landmark_q.at(map_point_id);
+                ceres::LossFunction* loss = new ceres::HuberLoss(
+                    kReliabilityConfig.huber_scale);
+                if (reliability_mode != LandmarkReliabilityMode::Standard)
+                    loss = new ceres::ScaledLoss(
+                        loss, q, ceres::TAKE_OWNERSHIP);
                 problem.AddResidualBlock(
-                    cost,
-                    new ceres::HuberLoss(1.0),
-                    pose_it->second.angle_axis,
+                    cost, loss, pose_it->second.angle_axis,
                     point_it->second.xyz
                 );
                 ++mono_observations;
