@@ -1047,6 +1047,40 @@ LocalBundleAdjuster::optimize(
                 kReliabilityConfig.min_q, 1.0);
         }
     }
+    if (reliability_mode == LandmarkReliabilityMode::Selective)
+    {
+        for (auto& reliability : result.landmark_reliabilities)
+        {
+            if (reliability.q < 0.30)
+            {
+                reliability.state = LandmarkOptimizationState::Rejected;
+                ++result.rejected_landmarks;
+            }
+            else if (reliability.q < 0.60)
+            {
+                reliability.state = LandmarkOptimizationState::FixedLandmark;
+                ++result.fixed_landmarks;
+            }
+            else if (reliability.q_window < 0.35)
+            {
+                reliability.state = LandmarkOptimizationState::FixedLandmark;
+                reliability.forced_fixed_by_q_window = true;
+                ++result.fixed_landmarks;
+                ++result.forced_fixed_by_q_window;
+            }
+            else
+            {
+                reliability.state = LandmarkOptimizationState::JointOptimize;
+                ++result.joint_optimized_landmarks;
+            }
+        }
+    }
+    else
+    {
+        result.joint_optimized_landmarks =
+            result.landmark_reliabilities.size();
+    }
+
     result.reliability_summary.count =
         result.landmark_reliabilities.size();
     std::vector<double> q_values;
@@ -1082,9 +1116,14 @@ LocalBundleAdjuster::optimize(
     }
 
     std::unordered_map<MapPointId, double> landmark_q;
+    std::unordered_map<MapPointId, LandmarkOptimizationState> landmark_state;
     landmark_q.reserve(result.landmark_reliabilities.size());
+    landmark_state.reserve(result.landmark_reliabilities.size());
     for (const auto& reliability : result.landmark_reliabilities)
+    {
         landmark_q.emplace(reliability.id, reliability.q);
+        landmark_state.emplace(reliability.id, reliability.state);
+    }
 
     for (const auto keyframe_id :
          active_keyframes)
@@ -1118,7 +1157,14 @@ LocalBundleAdjuster::optimize(
             continue;
         }
 
-        if (landmark_q.find(map_point->id) == landmark_q.end())
+        const auto reliability_it = landmark_q.find(map_point->id);
+        if (reliability_it == landmark_q.end())
+        {
+            continue;
+        }
+        if (reliability_mode == LandmarkReliabilityMode::Selective &&
+            landmark_state.at(map_point->id) ==
+                LandmarkOptimizationState::Rejected)
         {
             continue;
         }
@@ -1409,6 +1455,17 @@ LocalBundleAdjuster::optimize(
             );
         }
     }
+    else if (reliability_mode == LandmarkReliabilityMode::Selective)
+    {
+        for (auto& entry : points)
+        {
+            if (landmark_state.at(entry.first) ==
+                LandmarkOptimizationState::FixedLandmark)
+            {
+                problem.SetParameterBlockConstant(entry.second.xyz);
+            }
+        }
+    }
 
     // --------------------------------------------------------
     // Initial reprojection error.
@@ -1468,7 +1525,7 @@ LocalBundleAdjuster::optimize(
         );
 
     result.map_points_optimized =
-        points.size();
+        points.size() - result.fixed_landmarks;
 
     result.success =
         summary.IsSolutionUsable();

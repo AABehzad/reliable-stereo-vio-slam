@@ -29,12 +29,23 @@ enum class LandmarkReliabilityMode
 {
     Standard = 0,
     ActiveWindow = 1,
-    NoWindowAblation = 2
+    NoWindowAblation = 2,
+    Selective = 3
+};
+
+enum class LandmarkOptimizationState
+{
+    JointOptimize = 0,
+    FixedLandmark = 1,
+    Rejected = 2
 };
 
 struct LandmarkReliability
 {
     MapPointId id = 0;
+    LandmarkOptimizationState state =
+        LandmarkOptimizationState::JointOptimize;
+    bool forced_fixed_by_q_window = false;
     double q = 0.0;
     double q_obs = 0.0;
     double q_stereo = 0.0;
@@ -72,6 +83,10 @@ struct BundleAdjustmentResult
     std::size_t skipped_invalid_depth = 0;
     std::size_t skipped_nonfinite = 0;
     std::size_t quarantined_landmarks = 0;
+    std::size_t joint_optimized_landmarks = 0;
+    std::size_t fixed_landmarks = 0;
+    std::size_t rejected_landmarks = 0;
+    std::size_t forced_fixed_by_q_window = 0;
 
     LandmarkReliabilitySummary reliability_summary;
     std::vector<LandmarkReliability> landmark_reliabilities;

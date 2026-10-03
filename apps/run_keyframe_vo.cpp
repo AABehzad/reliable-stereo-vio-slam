@@ -145,10 +145,13 @@ struct LandmarkAuditRecord
     double pre_error = 0.0;
     double post_error = 0.0;
     double reliability_q = 0.0;
-    bool has_reliability = false;
     bool has_invalid_depth = false;
     bool outside_active_window = false;
     bool new_in_window = false;
+    bool has_reliability = false;
+    my_slam::LandmarkOptimizationState optimization_state =
+        my_slam::LandmarkOptimizationState::Rejected;
+    bool forced_fixed_by_q_window = false;
 };
 
 
@@ -362,7 +365,7 @@ int main(int argc, char** argv)
     if (argc >= 6)
     {
         const auto mode = std::stoul(argv[5]);
-        if (mode <= 2)
+        if (mode <= 3)
             reliability_mode = static_cast<my_slam::LandmarkReliabilityMode>(mode);
     }
 
@@ -504,7 +507,9 @@ int main(int argc, char** argv)
                     ? "/results/euroc_joint_ba_reliability.csv"
                     : reliability_mode == my_slam::LandmarkReliabilityMode::NoWindowAblation
                         ? "/results/euroc_joint_ba_no_window.csv"
-                        : "/results/euroc_joint_ba_standard.csv";
+                        : reliability_mode == my_slam::LandmarkReliabilityMode::Selective
+                            ? "/results/euroc_joint_ba_selective.csv"
+                            : "/results/euroc_joint_ba_standard.csv";
     std::ofstream trajectory(trajectory_path);
 
     if (!trajectory.is_open())
@@ -1727,6 +1732,9 @@ int main(int argc, char** argv)
                     {
                         record.reliability_q = it->q;
                         record.has_reliability = true;
+                        record.optimization_state = it->state;
+                        record.forced_fixed_by_q_window =
+                            it->forced_fixed_by_q_window;
                     }
                 }
                 const Eigen::Matrix4d correction =
@@ -1836,6 +1844,9 @@ int main(int argc, char** argv)
                         after.before = before_it->before;
                         after.reliability_q = before_it->reliability_q;
                         after.has_reliability = before_it->has_reliability;
+                        after.optimization_state = before_it->optimization_state;
+                        after.forced_fixed_by_q_window =
+                            before_it->forced_fixed_by_q_window;
                         after.displacement =
                             (after.before - local_map.getMapPoint(after.id)->position_w).norm();
                         after.post_error = after.pre_error;
@@ -2222,7 +2233,18 @@ int main(int argc, char** argv)
             }
             double movement_mean = 0.0;
             double error_mean = 0.0;
-            for (double value : movement) movement_mean += value;
+            std::size_t over_1cm = 0;
+            std::size_t over_10cm = 0;
+            std::size_t over_1m = 0;
+            std::size_t over_10m = 0;
+            for (double value : movement)
+            {
+                movement_mean += value;
+                if (value > 0.01) ++over_1cm;
+                if (value > 0.10) ++over_10cm;
+                if (value > 1.0) ++over_1m;
+                if (value > 10.0) ++over_10m;
+            }
             for (double value : errors) error_mean += value;
             std::cout
                 << label << ": count=" << movement.size()
@@ -2230,6 +2252,10 @@ int main(int argc, char** argv)
                 << " moveMedian=" << percentile(movement, 0.50)
                 << " moveP95=" << percentile(movement, 0.95)
                 << " moveMax=" << percentile(movement, 1.0)
+                << " >0.01m=" << over_1cm
+                << " >0.10m=" << over_10cm
+                << " >1m=" << over_1m
+                << " >10m=" << over_10m
                 << " preErrMean=" << error_mean / errors.size()
                 << " preErrMedian=" << percentile(errors, 0.50) << '\n';
         };
@@ -2294,6 +2320,20 @@ int main(int argc, char** argv)
         { return r.has_reliability && r.reliability_q >= 0.6 && r.reliability_q < 0.8; });
         print_group("Q>=0.8", [](const auto& r)
         { return r.has_reliability && r.reliability_q >= 0.8; });
+        if (reliability_mode == my_slam::LandmarkReliabilityMode::Selective)
+        {
+            print_group("Joint optimized", [](const auto& r)
+            { return r.has_reliability && r.optimization_state ==
+                my_slam::LandmarkOptimizationState::JointOptimize; });
+            print_group("Fixed landmarks", [](const auto& r)
+            { return r.has_reliability && r.optimization_state ==
+                my_slam::LandmarkOptimizationState::FixedLandmark; });
+            print_group("Rejected", [](const auto& r)
+            { return r.has_reliability && r.optimization_state ==
+                my_slam::LandmarkOptimizationState::Rejected; });
+            print_group("Forced fixed q_window", [](const auto& r)
+            { return r.has_reliability && r.forced_fixed_by_q_window; });
+        }
 
         std::cout
             << "Consistency audit: duplicateObservation=0"
@@ -2368,6 +2408,11 @@ int main(int argc, char** argv)
             << "Quarantined landmarks: "
             << ba_result.quarantined_landmarks
             << '\n'
+            << "Joint/Fixed/Rejected/ForcedFixed: "
+            << ba_result.joint_optimized_landmarks << "/"
+            << ba_result.fixed_landmarks << "/"
+            << ba_result.rejected_landmarks << "/"
+            << ba_result.forced_fixed_by_q_window << '\n'
             << "Reliability Q mean/median/p10/p25/p75/p90: "
             << ba_result.reliability_summary.mean << " / "
             << ba_result.reliability_summary.median << " / "
