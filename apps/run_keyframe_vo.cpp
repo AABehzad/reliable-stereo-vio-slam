@@ -706,6 +706,7 @@ int main(int argc, char** argv)
 
     std::size_t successful_frames = 0;
     std::size_t keyframes_created = 1;
+    std::size_t total_pathological_step_rejected_count = 0;
 
     double total_pnp_inliers = 0.0;
     double total_correspondences = 0.0;
@@ -1717,6 +1718,8 @@ int main(int argc, char** argv)
                         !pose_only_ba,
                         reliability_mode
                     );
+                total_pathological_step_rejected_count +=
+                    inline_ba_result.pathological_step_rejected_count;
             }
 
             if (run_inline_ba)
@@ -2413,6 +2416,11 @@ int main(int argc, char** argv)
             << ba_result.fixed_landmarks << "/"
             << ba_result.rejected_landmarks << "/"
             << ba_result.forced_fixed_by_q_window << '\n'
+            << "Pathological landmark steps rejected: "
+            << ba_result.pathological_step_rejected_count << '\n'
+            << "Cumulative pathological steps rejected: "
+            << (total_pathological_step_rejected_count +
+                ba_result.pathological_step_rejected_count) << '\n'
             << "Reliability Q mean/median/p10/p25/p75/p90: "
             << ba_result.reliability_summary.mean << " / "
             << ba_result.reliability_summary.median << " / "

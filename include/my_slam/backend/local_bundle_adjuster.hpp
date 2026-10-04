@@ -87,6 +87,7 @@ struct BundleAdjustmentResult
     std::size_t fixed_landmarks = 0;
     std::size_t rejected_landmarks = 0;
     std::size_t forced_fixed_by_q_window = 0;
+    std::size_t pathological_step_rejected_count = 0;
 
     LandmarkReliabilitySummary reliability_summary;
     std::vector<LandmarkReliability> landmark_reliabilities;

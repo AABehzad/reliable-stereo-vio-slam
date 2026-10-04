@@ -375,3 +375,46 @@ The zero movement of fixed and forced-fixed landmarks confirms the mechanical ef
 Stage 15 Q and selective landmark optimization are implemented correctly at the requested control points. The fresh 0–100 evidence shows that selective BA improves trajectory metrics and substantially reduces large MapPoint motion counts, while fixed landmarks remain numerically stationary. It is therefore a useful stabilization stage, but not a complete solution to pathological jointly optimized landmarks.
 
 The project is best characterized as a strong stereo VO system with Local BA, experimental reliability-aware landmark control, loop/pose-graph infrastructure, and a loosely coupled IMU propagation path. The principal work required before claiming complete Stereo VIO-SLAM is tightly coupled IMU optimization, validated loop closure/pose graph behavior, stronger landmark-state safeguards, and reproducible runtime/evaluation integrity.
+
+## 14. Stage 15.1 — Depth Bounds and Landmark Step Protection
+
+Stage 15.1 adds a commit-time safety guard without changing the Q formula, Q weights, or selective thresholds.
+
+### Implementation
+
+- Guard configuration is defined in `src/backend/local_bundle_adjuster.cpp:35-42`:
+  - minimum camera depth: `0.1 m`;
+  - maximum camera depth: `50.0 m`;
+  - maximum accepted MapPoint step: `2.0 m`.
+- Pre-BA MapPoint positions are snapshotted before solving in `src/backend/local_bundle_adjuster.cpp:1032-1044`.
+- After a usable Ceres solve, each jointly optimized candidate is checked in `src/backend/local_bundle_adjuster.cpp:1588-1673` for:
+  - finite pre-BA and post-BA coordinates;
+  - displacement no greater than `2.0 m`;
+  - camera-0 and camera-1 depth in `(0.1, 50.0) m` for available observing KeyFrames.
+- Invalid candidates are rolled back to their pre-BA position and counted in `BundleAdjustmentResult::pathological_step_rejected_count`, declared at `include/my_slam/backend/local_bundle_adjuster.hpp:80-93`.
+- Runtime output reports final-BA and cumulative rejection counts in `apps/run_keyframe_vo.cpp:2419-2423`.
+
+Fixed and rejected selective landmarks are not counted as pathological step rejections because their MapPoint blocks are not variable updates. The existing `summary.IsSolutionUsable()` transactional barrier remains unchanged.
+
+### Guarded 0–100 benchmark
+
+Command:
+
+    cmake --build build
+    MY_SLAM_TRAJECTORY_PATH=/results/audit_stage15_guarded_0_100.csv ./build/run_keyframe_vo 0 100 1 0 3
+    python3 scripts/evaluate_vo.py /results/audit_stage15_guarded_0_100.csv
+
+| Metric | Previous selective BA | Stage 15.1 guarded BA |
+|---|---:|---:|
+| ATE RMSE | 0.015530 m | 0.015768 m |
+| RPE translation RMSE | 0.005979 m | 0.005966 m |
+| RPE rotation RMSE | 0.060245 deg | 0.060211 deg |
+| Final position error | 0.017062 m | 0.017376 m |
+| MapPoint movement >1 m | 478 | 236 |
+| MapPoint movement >10 m | 35 | 0 |
+| Final BA rejected steps | — | 59 |
+| Cumulative rejected steps over run | — | 706 |
+
+The guarded run completed with a valid 102-line trajectory file and evaluator exit code 0. The safety objective was met: all measured MapPoint movement was below `10 m`, and the final jointly optimized group had maximum movement `1.99867 m`, consistent with the `2.0 m` commit threshold. The guard slightly changed trajectory metrics: ATE and final position error were marginally worse, while both translational and rotational RPE improved slightly. This is an expected trade-off from rolling back weakly supported landmark updates.
+
+The diagnostic output still contains one warning per rejected update, so repeated inline BA calls produce many log lines. The cumulative counter is the appropriate run-level value; the final-BA counter is the value for the final active-window solve only.

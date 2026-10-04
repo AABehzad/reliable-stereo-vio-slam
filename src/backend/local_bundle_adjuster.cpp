@@ -32,6 +32,15 @@ struct PointBlock
     double xyz[3] = {0.0, 0.0, 0.0};
 };
 
+struct LandmarkGuardConfig
+{
+    double min_depth_m = 0.1;
+    double max_depth_m = 50.0;
+    double max_step_m = 2.0;
+};
+
+constexpr LandmarkGuardConfig kLandmarkGuardConfig{};
+
 struct ReliabilityConfig
 {
     double obs_scale = 3.0;
@@ -1020,11 +1029,17 @@ LocalBundleAdjuster::optimize(
         PointBlock
     > points;
 
+    std::unordered_map<MapPointId, Eigen::Vector3d> pre_ba_positions;
+
     poses.reserve(
         active_keyframes.size()
     );
 
     points.reserve(
+        active_map_points.size()
+    );
+
+    pre_ba_positions.reserve(
         active_map_points.size()
     );
 
@@ -1183,6 +1198,10 @@ LocalBundleAdjuster::optimize(
         points.emplace(
             map_point->id,
             block
+        );
+        pre_ba_positions.emplace(
+            map_point->id,
+            map_point->position_w
         );
     }
 
@@ -1565,6 +1584,109 @@ LocalBundleAdjuster::optimize(
     // --------------------------------------------------------
     // Write optimized MapPoints back.
     // --------------------------------------------------------
+
+    // Landmark updates receive an explicit commit-time guard. Ceres may find
+    // a numerically usable solution whose weakly constrained point has moved
+    // to an implausible location. Keep the pre-BA point in that case.
+    for (auto& [map_point_id, point] : points)
+    {
+        const auto map_point =
+            local_map.getMapPoint(
+                map_point_id
+            );
+
+        const auto pre_it =
+            pre_ba_positions.find(map_point_id);
+
+        if (!map_point || pre_it == pre_ba_positions.end())
+        {
+            continue;
+        }
+
+        const bool fixed_by_selective_policy =
+            reliability_mode == LandmarkReliabilityMode::Selective &&
+            landmark_state.at(map_point_id) ==
+                LandmarkOptimizationState::FixedLandmark;
+        if (!optimize_points || fixed_by_selective_policy)
+        {
+            continue;
+        }
+
+        const Eigen::Vector3d pre_position =
+            pre_it->second;
+        const Eigen::Vector3d candidate(
+            point.xyz[0],
+            point.xyz[1],
+            point.xyz[2]
+        );
+
+        bool valid =
+            pre_position.allFinite() &&
+            candidate.allFinite() &&
+            (candidate - pre_position).norm() <=
+                kLandmarkGuardConfig.max_step_m;
+
+        if (valid)
+        {
+            bool observed = false;
+            for (const auto& [keyframe_id, unused] :
+                 map_point->observations)
+            {
+                const auto keyframe =
+                    local_map.getKeyFrame(keyframe_id);
+                if (!keyframe)
+                {
+                    continue;
+                }
+
+                observed = true;
+                Eigen::Matrix4d T_W_C = keyframe->T_W_C;
+                const auto pose_it = poses.find(keyframe_id);
+                if (pose_it != poses.end())
+                {
+                    T_W_C = poseToCameraWorld(pose_it->second).inverse();
+                }
+
+                const Eigen::Vector4d X_C =
+                    T_W_C.inverse() *
+                    Eigen::Vector4d(
+                        candidate.x(), candidate.y(), candidate.z(), 1.0);
+
+                if (!X_C.allFinite() ||
+                    X_C.z() <= kLandmarkGuardConfig.min_depth_m ||
+                    X_C.z() >= kLandmarkGuardConfig.max_depth_m)
+                {
+                    valid = false;
+                    break;
+                }
+
+                const Eigen::Vector4d X_C1 =
+                    T_cam1_cam0 * X_C;
+                if (!X_C1.allFinite() ||
+                    X_C1.z() <= kLandmarkGuardConfig.min_depth_m ||
+                    X_C1.z() >= kLandmarkGuardConfig.max_depth_m)
+                {
+                    valid = false;
+                    break;
+                }
+            }
+            valid = valid && observed;
+        }
+
+        if (!valid)
+        {
+            ++result.pathological_step_rejected_count;
+            std::cerr
+                << "Local BA landmark update rejected: id="
+                << map_point_id
+                << " step="
+                << (candidate - pre_position).norm()
+                << " (retaining pre-BA position)\n";
+            point.xyz[0] = pre_position.x();
+            point.xyz[1] = pre_position.y();
+            point.xyz[2] = pre_position.z();
+        }
+    }
 
     for (auto& [map_point_id, point] :
          points)
